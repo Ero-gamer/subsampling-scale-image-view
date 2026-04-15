@@ -1,4 +1,4 @@
-Subsampling Scale Image View (Kotatsu fork)
+Subsampling Scale Image View (Enhanced Edition based on Kotatsu SSIV Fork)
 ===========================
 
 > A custom image view for Android, designed for photo galleries and displaying huge images (e.g. maps and building
@@ -14,6 +14,7 @@ Subsampling Scale Image View (Kotatsu fork)
 - Supports Interpolator for animation
 - Handle mouse and keyboard/dpad events for scaling and panning
 - Supports downsampling
+- Fixed and upgraded image quality decoder to use ARGB_8888
 
 ---
 
@@ -34,8 +35,8 @@ Subsampling Scale Image View (Kotatsu fork)
 
     ```groovy
     dependencies {
-        implementation("com.github.KotatsuApp:subsampling-scale-image-view:$version")
+        implementation("com.github.Ero-gamer:subsampling-scale-image-view:$version")
     }
     ```
 
-   See for versions at [JitPack](https://jitpack.io/#KotatsuApp/subsampling-scale-image-view)
+   See for versions at [JitPack](https://jitpack.io/#Ero-gamer/subsampling-scale-image-view)
