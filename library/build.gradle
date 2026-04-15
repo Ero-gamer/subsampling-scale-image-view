@@ -1,82 +1,78 @@
 plugins {
-	id 'com.android.library'
-	id 'kotlin-android'
-	id 'kotlin-parcelize'
-	id 'maven-publish'
+    id 'com.android.library'
+    id 'kotlin-android'
+    id 'kotlin-parcelize'
+    id 'maven-publish'
 }
 
 group = 'com.davemorrissey.labs'
 archivesBaseName = 'subsampling-scale-image-view-androidx'
-version = '4.2.2'
+version = '4.2.3'
 
 android {
-	compileSdk = 34
-	namespace = 'com.davemorrissey.labs.subscaleview'
-	
-publishing {
+    compileSdk = 34
+    namespace = 'com.davemorrissey.labs.subscaleview'
+    
+    // This must be INSIDE the android block
+    publishing {
         singleVariant("release")
     }
-}
 	
     defaultConfig {
-		minSdk = 23
-		targetSdk = 34
+        minSdk = 23
+        targetSdk = 34
         consumerProguardFiles 'proguard-rules.txt'
     }
 
-	compileOptions {
-		sourceCompatibility JavaVersion.VERSION_17
-		targetCompatibility JavaVersion.VERSION_17
-	}
+    compileOptions {
+        sourceCompatibility JavaVersion.VERSION_17
+        targetCompatibility JavaVersion.VERSION_17
+    }
 
-	kotlinOptions {
-		jvmTarget = JavaVersion.VERSION_17.toString()
-		freeCompilerArgs += '-Xexplicit-api=warning'
-	}
+    kotlinOptions {
+        jvmTarget = JavaVersion.VERSION_17.toString()
+        freeCompilerArgs += '-Xexplicit-api=warning'
+    }
 
-	buildTypes {
-		release {
-			minifyEnabled false
-			proguardFiles getDefaultProguardFile('proguard-android-optimize.txt'), 'proguard-rules.pro'
-		}
-	}
-}
+    buildTypes {
+        release {
+            minifyEnabled false
+            proguardFiles getDefaultProguardFile('proguard-android-optimize.txt'), 'proguard-rules.pro'
+        }
+    }
+} // This brace correctly closes the android block
 
 configurations {
     javadocs
 }
 
 dependencies {
-	implementation 'org.jetbrains.kotlin:kotlin-stdlib:2.3.20'
+    implementation 'org.jetbrains.kotlin:kotlin-stdlib:2.3.20'
     implementation "androidx.customview:customview:1.2.0"
     javadocs 'androidx.annotation:annotation:1.10.0'
     javadocs 'androidx.exifinterface:exifinterface:1.4.2'
     implementation 'androidx.annotation:annotation:1.10.0'
     implementation 'androidx.exifinterface:exifinterface:1.4.2'
-	implementation 'androidx.lifecycle:lifecycle-runtime-ktx:2.10.0'
-	implementation 'org.jetbrains.kotlinx:kotlinx-coroutines-android:1.10.2'
+    implementation 'androidx.lifecycle:lifecycle-runtime-ktx:2.10.0'
+    implementation 'org.jetbrains.kotlinx:kotlinx-coroutines-android:1.10.2'
 }
 
 afterEvaluate {
-	publishing {
-		publications {
-			release(MavenPublication) {
-				from components.release
-				groupId = 'com.github.Ero-gamer'
-				artifactId = 'subsampling-scale-image-view-androidx'
-				version = '4.2.2'
-			}
-		}
-	}
+    publishing {
+        publications {
+            release(MavenPublication) {
+                from components.release
+                groupId = 'com.github.Ero-gamer'
+                artifactId = 'subsampling-scale-image-view-androidx'
+                version = '4.2.3'
+            }
+        }
+    }
 }
 
+// Cleaned up Javadoc task to prevent "Unexpected input" errors
 task javadoc(type: Javadoc) {
     failOnError false
     source = android.sourceSets.main.java.sourceFiles
-    destinationDir = rootProject.file("docs/javadoc")
     classpath += project.files(android.getBootClasspath().join(File.pathSeparator))
-    classpath += configurations.implementation
-    classpath += configurations.javadocs
-    options.noTimestamp = true
-    options.links = ['https://developer.android.com/reference/']
 }
