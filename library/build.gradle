@@ -58,7 +58,7 @@ afterEvaluate {
 		publications {
 			release(MavenPublication) {
 				from components.release
-				groupId = 'com.github.KotatsuApp'
+				groupId = 'com.github.Ero-gamer'
 				artifactId = 'subsampling-scale-image-view-androidx'
 				version = '4.0'
 			}
