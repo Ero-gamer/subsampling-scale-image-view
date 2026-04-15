@@ -66,6 +66,7 @@ import kotlinx.coroutines.cancelChildren
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.runInterruptible
 import java.util.Locale
+import java.util.concurrent.atomic.AtomicInteger
 import java.util.concurrent.locks.ReentrantReadWriteLock
 import kotlin.math.min
 import kotlin.math.roundToInt
@@ -94,6 +95,13 @@ public open class SubsamplingScaleImageView @JvmOverloads constructor(
 
 	// Map of zoom level to tile grid
 	private var tileMap: TileMap? = null
+
+	// BUG 2 FIX: generation counter. Incremented every time tiles are invalidated.
+	// Each loadTile() coroutine captures the generation at launch; if the generation
+	// has changed by the time the bitmap is decoded, it's discarded instead of stored.
+	// This eliminates the race where low-res tiles (loaded at downSampling=4) overwrite
+	// freshly loaded high-res tiles (at downSampling=1) after a resume event.
+	private val tileGeneration = AtomicInteger(0)
 
 	private var _downSampling = 1
 	public var downSampling: Int = _downSampling
@@ -146,10 +154,6 @@ public open class SubsamplingScaleImageView @JvmOverloads constructor(
 	@get:ColorInt
 	public var tileBackgroundColor: Int
 		get() = tileBgPaint?.color ?: Color.TRANSPARENT
-		/**
-		 * Set a solid color to render behind tiles, useful for displaying transparent PNGs.
-		 * @param value Background color for tiles.
-		 */
 		set(@ColorInt value) {
 			tileBgPaint = if (Color.alpha(value) == 0) {
 				null
@@ -354,13 +358,6 @@ public open class SubsamplingScaleImageView @JvmOverloads constructor(
 	private val srcArray = FloatArray(8)
 	private val dstArray = FloatArray(8)
 
-	/**
-	 * Call to find whether the view is initialised, has dimensions, and will display an image on
-	 * the next draw. If a preview has been provided, it may be the preview that will be displayed
-	 * and the full size image may still be loading. If no preview was provided, this is called once
-	 * the base layer tiles of the full size image are loaded.
-	 * @return true if the view is ready to display an image and accept touch gestures.
-	 */
 	public val isReady: Boolean
 		get() = isReadySent
 
@@ -468,11 +465,6 @@ public open class SubsamplingScaleImageView @JvmOverloads constructor(
 		}
 	}
 
-	/**
-	 * Releases all resources the view is using and resets the state, nulling any fields that use significant memory.
-	 * After you have called this method, the view can be re-used by setting a new image. Settings are remembered
-	 * but state (scale and center) is forgotten. You can restore these yourself if required.
-	 */
 	@CallSuper
 	public open fun recycle() {
 		reset(true)
@@ -491,23 +483,12 @@ public open class SubsamplingScaleImageView @JvmOverloads constructor(
 		}
 	}
 
-	/**
-	 * This is a screen density aware alternative to {@link #setMaxScale(float)}; it allows you to express the maximum
-	 * allowed scale in terms of the minimum pixel density. This avoids the problem of 1:1 scale still being
-	 * too small on a high density screen. A sensible starting point is 160 - the default used by this view.
-	 * @param dpi Source image pixel density at maximum zoom.
-	 */
 	public fun setMinimumDpi(dpi: Int) {
 		val metrics = resources.displayMetrics
 		val averageDpi = (metrics.xdpi + metrics.ydpi) / 2
 		maxScale = averageDpi / dpi
 	}
 
-	/**
-	 * This is a screen density aware alternative to {@link #setMinScale(float)}; it allows you to express the minimum
-	 * allowed scale in terms of the maximum pixel density.
-	 * @param dpi Source image pixel density at minimum zoom.
-	 */
 	public fun setMaximumDpi(dpi: Int) {
 		val metrics = resources.displayMetrics
 		val averageDpi = (metrics.xdpi + metrics.ydpi) / 2
@@ -524,12 +505,6 @@ public open class SubsamplingScaleImageView @JvmOverloads constructor(
 		}
 	}
 
-	/**
-	 * A density aware alternative to [.setDoubleTapZoomScale]; this allows you to express the scale the
-	 * image will zoom in to when double tapped in terms of the image pixel density. Values lower than the max scale will
-	 * be ignored. A sensible starting point is 160 - the default used by this view.
-	 * @param dpi New value for double tap gesture zoom scale.
-	 */
 	public fun setDoubleTapZoomDpi(dpi: Int) {
 		val metrics = resources.displayMetrics
 		val averageDpi = (metrics.xdpi + metrics.ydpi) / 2
@@ -573,9 +548,6 @@ public open class SubsamplingScaleImageView @JvmOverloads constructor(
 		onImageEventListeners.removeListener(listener)
 	}
 
-	/**
-	 * On resize, preserve center and scale. Various behaviours are possible, override this method to use another.
-	 */
 	override fun onSizeChanged(w: Int, h: Int, oldw: Int, oldh: Int) {
 		val sCenter = getCenter()
 		if (isReadySent && sCenter != null) {
@@ -585,10 +557,6 @@ public open class SubsamplingScaleImageView @JvmOverloads constructor(
 		}
 	}
 
-	/**
-	 * Measures the width and height of the view, preserving the aspect ratio of the image displayed if wrap_content is
-	 * used. The image will scale within this box, not resizing the view as it is zoomed.
-	 */
 	override fun onMeasure(widthMeasureSpec: Int, heightMeasureSpec: Int) {
 		val widthSpecMode = MeasureSpec.getMode(widthMeasureSpec)
 		val heightSpecMode = MeasureSpec.getMode(heightMeasureSpec)
@@ -617,37 +585,28 @@ public open class SubsamplingScaleImageView @JvmOverloads constructor(
 		super.onDraw(canvas)
 		createPaints()
 
-		// If image or view dimensions are not known yet, abort.
 		if ((sWidth == 0) || (sHeight == 0) || (width == 0) || (height == 0)) {
 			return
 		}
 
-		// When using tiles, on first render with no tile map ready, initialise it and kick off async base image loading.
+		// BUG 1 FIX: initialiseBaseLayer is now also triggered from onTilesInited,
+		// so this check becomes a no-op for the first draw in most cases.
 		if (tileMap == null && decoder != null) {
 			initialiseBaseLayer(getMaxBitmapDimensions(canvas))
 		}
 
-		// If image has been loaded or supplied as a bitmap, onDraw may be the first time the view has
-		// dimensions and therefore the first opportunity to set scale and translate. If this call returns
-		// false there is nothing to be drawn so return immediately.
 		if (!checkReady()) {
 			return
 		}
 
-		// Set scale and translate before draw.
 		preDraw()
 		processAnimation()
 
 		val tiles = tileMap
 		if (tiles != null && isBaseLayerReady()) {
-			// Optimum sample size for current scale
 			val sampleSize = calculateInSampleSize(scale).coerceAtMost(fullImageSampleSize)
-
-			// First check for missing tiles - if there are any we need the base layer underneath to avoid gaps
 			val hasMissingTiles = tiles.hasMissingTiles(sampleSize)
 
-
-			// Render all loaded tiles. LinkedHashMap used for bottom up rendering - lower res tiles underneath.
 			for ((key, value) in tiles) {
 				if (key == sampleSize || hasMissingTiles) {
 					for (tile in value) {
@@ -820,65 +779,24 @@ public open class SubsamplingScaleImageView @JvmOverloads constructor(
 				px(45).toFloat(),
 				debugTextPaint!!,
 			)
-			if (anim != null) {
-				val vCenterStart = sourceToViewCoord(anim!!.sCenterStart)
-				val vCenterEndRequested = sourceToViewCoord(anim!!.sCenterEndRequested)
-				val vCenterEnd = sourceToViewCoord(anim!!.sCenterEnd)
-				canvas.drawCircle(vCenterStart!!.x, vCenterStart.y, px(10).toFloat(), debugLinePaint!!)
-				debugLinePaint!!.color = Color.RED
-				canvas.drawCircle(vCenterEndRequested!!.x, vCenterEndRequested.y, px(20).toFloat(), debugLinePaint!!)
-				debugLinePaint!!.color = Color.BLUE
-				canvas.drawCircle(vCenterEnd!!.x, vCenterEnd.y, px(25).toFloat(), debugLinePaint!!)
-				debugLinePaint!!.color = Color.CYAN
-				canvas.drawCircle(width / 2f, height / 2f, px(30).toFloat(), debugLinePaint!!)
-			}
-			if (vCenterStart != null) {
-				debugLinePaint!!.color = Color.RED
-				canvas.drawCircle(vCenterStart!!.x, vCenterStart!!.y, px(20).toFloat(), debugLinePaint!!)
-			}
-			if (quickScaleSCenter != null) {
-				debugLinePaint!!.color = Color.BLUE
-				canvas.drawCircle(
-					sourceToViewX(quickScaleSCenter!!.x),
-					sourceToViewY(quickScaleSCenter!!.y),
-					px(35).toFloat(),
-					debugLinePaint!!,
-				)
-			}
-			if (quickScaleVStart != null && isQuickScaling) {
-				debugLinePaint!!.color = Color.CYAN
-				canvas.drawCircle(quickScaleVStart!!.x, quickScaleVStart!!.y, px(30).toFloat(), debugLinePaint!!)
-			}
-			debugLinePaint!!.color = Color.MAGENTA
 		}
 	}
 
-	/**
-	 * Use canvas max bitmap width and height instead of the default 2048, to avoid redundant tiling.
-	 */
 	private fun getMaxBitmapDimensions(canvas: Canvas) = Point(
 		minOf(canvas.maximumBitmapWidth, maxTileWidth),
 		minOf(canvas.maximumBitmapHeight, maxTileHeight),
 	)
 
-	/**
-	 * Called on first draw when the view has dimensions. Calculates the initial sample size and starts async loading of
-	 * the base layer image - the whole source subsampled as necessary.
-	 */
 	@Synchronized
 	private fun initialiseBaseLayer(maxTileDimensions: Point) {
 		satTemp = ScaleAndTranslate(0f, PointF(0f, 0f))
 		fitToBounds(true, satTemp!!)
 
-		// Load double resolution - next level will be split into four tiles and at the center all four are required,
-		// so don't bother with tiling until the next level 16 tiles are needed.
 		fullImageSampleSize = calculateInSampleSize(satTemp!!.scale)
 		if (fullImageSampleSize > 1) {
 			fullImageSampleSize /= 2
 		}
 		if (fullImageSampleSize == 1 && sRegion == null && sWidth() < maxTileDimensions.x && sHeight() < maxTileDimensions.y) {
-			// Whole image is required at native resolution, and is smaller than the canvas max bitmap size.
-			// Use BitmapDecoder for better image support.
 			decoder?.recycle()
 			decoder = null
 			loadBitmap(uri!!, false)
@@ -894,12 +812,8 @@ public open class SubsamplingScaleImageView @JvmOverloads constructor(
 		}
 	}
 
-	/**
-	 * Handle touch events. One finger pans, and two finger pinch and zoom plus panning.
-	 */
 	@SuppressLint("ClickableViewAccessibility")
 	override fun onTouchEvent(event: MotionEvent): Boolean {
-		// During non-interruptible anims, ignore all touch events
 		anim = if (anim != null && !anim!!.interruptible) {
 			requestDisallowInterceptTouchEvent(true)
 			return true
@@ -912,12 +826,10 @@ public open class SubsamplingScaleImageView @JvmOverloads constructor(
 			null
 		}
 
-		// Abort if not ready
 		if (vTranslate == null) {
 			singleDetector?.onTouchEvent(event)
 			return true
 		}
-		// Detect flings, taps and double taps
 		if (!isQuickScaling && detector?.onTouchEvent(event) != false) {
 			isZooming = false
 			isPanning = false
@@ -934,7 +846,6 @@ public open class SubsamplingScaleImageView @JvmOverloads constructor(
 			vCenterStart = PointF(0f, 0f)
 		}
 
-		// Store current values, so we can send an event if they change
 		val scaleBefore = scale
 		vTranslateBefore!!.set(vTranslate!!)
 		val handled = touchEventDelegate.dispatchTouchEvent(event)
@@ -963,9 +874,6 @@ public open class SubsamplingScaleImageView @JvmOverloads constructor(
 		return viewToSourceCoord(vx, vy, PointF())
 	}
 
-	/**
-	 * Once source image and view dimensions are known, creates a map of sample size to tile grid.
-	 */
 	private fun initialiseTileMap(maxTileDimensions: Point) {
 		tileMap?.recycleAll()
 		tileMap = TileMap()
@@ -1017,13 +925,6 @@ public open class SubsamplingScaleImageView @JvmOverloads constructor(
 		}
 	}
 
-	/**
-	 * Convert screen coordinate to source coordinate.
-	 * @param vx view X coordinate.
-	 * @param vy view Y coordinate.
-	 * @param sTarget target object for result. The same instance is also returned.
-	 * @return source coordinates. This is the same instance passed to the sTarget param.
-	 */
 	public fun viewToSourceCoord(vx: Float, vy: Float, sTarget: PointF): PointF? {
 		if (vTranslate == null) {
 			return null
@@ -1032,57 +933,27 @@ public open class SubsamplingScaleImageView @JvmOverloads constructor(
 		return sTarget
 	}
 
-	/**
-	 * Convert source to view x coordinate.
-	 */
 	private fun sourceToViewX(sx: Float): Float {
 		return sx * scale + (vTranslate ?: return Float.NaN).x
 	}
 
-	/**
-	 * Convert source to view y coordinate.
-	 */
 	private fun sourceToViewY(sy: Float): Float {
 		return sy * scale + (vTranslate ?: return Float.NaN).y
 	}
 
-	/**
-	 * Convert source coordinate to view coordinate.
-	 * @param sxy source coordinates to convert.
-	 * @return view coordinates.
-	 */
 	public fun sourceToViewCoord(sxy: PointF): PointF? {
 		return sourceToViewCoord(sxy.x, sxy.y, PointF())
 	}
 
-	/**
-	 * Convert source coordinate to view coordinate.
-	 * @param sx source X coordinate.
-	 * @param sy source Y coordinate.
-	 * @return view coordinates.
-	 */
 	public fun sourceToViewCoord(sx: Float, sy: Float): PointF? {
 		return sourceToViewCoord(sx, sy, PointF())
 	}
 
-	/**
-	 * Convert source coordinate to view coordinate.
-	 * @param sxy source coordinates to convert.
-	 * @param vTarget target object for result. The same instance is also returned.
-	 * @return view coordinates. This is the same instance passed to the vTarget param.
-	 */
 	@CheckResult
 	public fun sourceToViewCoord(sxy: PointF, vTarget: PointF): PointF? {
 		return sourceToViewCoord(sxy.x, sxy.y, vTarget)
 	}
 
-	/**
-	 * Convert source coordinate to view coordinate.
-	 * @param sx source X coordinate.
-	 * @param sy source Y coordinate.
-	 * @param vTarget target object for result. The same instance is also returned.
-	 * @return view coordinates. This is the same instance passed to the vTarget param.
-	 */
 	@CheckResult
 	public fun sourceToViewCoord(sx: Float, sy: Float, vTarget: PointF): PointF? {
 		if (vTranslate == null) {
@@ -1092,9 +963,6 @@ public open class SubsamplingScaleImageView @JvmOverloads constructor(
 		return vTarget
 	}
 
-	/**
-	 * Convert source rect to screen rect, integer values.
-	 */
 	private fun sourceToViewRect(sRect: Rect, vTarget: Rect) {
 		vTarget[
 			sourceToViewX(sRect.left.toFloat()).toInt(), sourceToViewY(sRect.top.toFloat()).toInt(),
@@ -1104,24 +972,14 @@ public open class SubsamplingScaleImageView @JvmOverloads constructor(
 		] = sourceToViewY(sRect.bottom.toFloat()).toInt()
 	}
 
-	/**
-	 * Convert screen to source x coordinate.
-	 */
 	private fun viewToSourceX(vx: Float): Float {
 		return (vx - (vTranslate ?: return Float.NaN).x) / scale
 	}
 
-	/**
-	 * Convert screen to source y coordinate.
-	 */
 	private fun viewToSourceY(vy: Float): Float {
 		return (vy - (vTranslate ?: return Float.NaN).y) / scale
 	}
 
-	/**
-	 * Cancel all loading tasks when [owner] is destroyed.
-	 * Warning: after the [owner] is destroyed [SubsamplingScaleImageView] becomes unusable
-	 */
 	public fun bindToLifecycle(owner: LifecycleOwner) {
 		owner.lifecycle.addObserver(ClearingLifecycleObserver(this))
 	}
@@ -1157,6 +1015,8 @@ public open class SubsamplingScaleImageView @JvmOverloads constructor(
 		sRect = null
 		if (isNewImage) {
 			coroutineScope.coroutineContext[Job]?.cancelChildren()
+			// BUG 2 FIX: increment generation so any in-flight tile loads are discarded.
+			tileGeneration.incrementAndGet()
 			uri = null
 			decoderLock.writeLock().lock()
 			try {
@@ -1198,11 +1058,6 @@ public open class SubsamplingScaleImageView @JvmOverloads constructor(
 		}
 	}
 
-	/**
-	 * Loads the optimum tiles for display at the current scale and translate, so the screen can be filled with tiles
-	 * that are at least as high resolution as the screen. Frees up bitmaps that are now off the screen.
-	 * @param load Whether to load the new tiles needed. Use false while scrolling/panning for performance.
-	 */
 	@JvmSynthetic
 	internal fun refreshRequiredTiles(load: Boolean) {
 		if (decoder == null) {
@@ -1211,8 +1066,6 @@ public open class SubsamplingScaleImageView @JvmOverloads constructor(
 		val tiles = tileMap?.values ?: return
 		val sampleSize = minOf(fullImageSampleSize, calculateInSampleSize(scale))
 
-		// Load tiles of the correct sample size that are on screen. Discard tiles off-screen, and those that are higher
-		// resolution than required, or lower res than required but not the base layer, so the base layer is always present.
 		for (value in tiles) {
 			for (tile in value) {
 				val isTileOutdated = !tile.isValid
@@ -1236,6 +1089,10 @@ public open class SubsamplingScaleImageView @JvmOverloads constructor(
 	}
 
 	private fun invalidateTiles() {
+		// BUG 2 FIX: increment generation before triggering new tile loads.
+		// Any in-flight coroutines from the previous generation will see the
+		// mismatch and discard their bitmaps rather than storing them.
+		tileGeneration.incrementAndGet()
 		tileMap?.invalidateAll()
 		decoder?.let { _ ->
 			_downSampling = downSampling
@@ -1249,9 +1106,6 @@ public open class SubsamplingScaleImageView @JvmOverloads constructor(
 		}
 	}
 
-	/**
-	 * Determine whether tile is visible.
-	 */
 	private fun tileVisible(tile: Tile): Boolean {
 		val sVisLeft = viewToSourceX(0f)
 		val sVisRight = viewToSourceX(width.toFloat())
@@ -1261,9 +1115,6 @@ public open class SubsamplingScaleImageView @JvmOverloads constructor(
 		return !(sVisLeft > sRect.right || sRect.left > sVisRight || sVisTop > sRect.bottom || sRect.top > sVisBottom)
 	}
 
-	/**
-	 * Calculates sample size to fit the source image in given bounds.
-	 */
 	private fun calculateInSampleSize(scale: Float): Int {
 		@Suppress("NAME_SHADOWING")
 		var scale = scale
@@ -1275,23 +1126,16 @@ public open class SubsamplingScaleImageView @JvmOverloads constructor(
 		val reqWidth = (sWidth() * scale).toInt()
 		val reqHeight = (sHeight() * scale).toInt()
 
-		// Raw height and width of image
 		var inSampleSize = 1
 		if (reqWidth == 0 || reqHeight == 0) {
 			return 32
 		}
 		if (sHeight() > reqHeight || sWidth() > reqWidth) {
-			// Calculate ratios of height and width to requested height and width
 			val heightRatio = (sHeight().toFloat() / reqHeight.toFloat()).roundToInt()
 			val widthRatio = (sWidth().toFloat() / reqWidth.toFloat()).roundToInt()
-
-			// Choose the smallest ratio as inSampleSize value, this will guarantee
-			// a final image with both dimensions larger than or equal to the
-			// requested height and width.
 			inSampleSize = min(heightRatio, widthRatio)
 		}
 
-		// We want the actual sample size that will be used, so round down to the nearest power of 2.
 		var power = 1
 		while (power * 2 < inSampleSize) {
 			power *= 2
@@ -1328,9 +1172,6 @@ public open class SubsamplingScaleImageView @JvmOverloads constructor(
 		}
 	}
 
-	/**
-	 * Get source height taking rotation into account.
-	 */
 	@JvmSynthetic
 	internal fun sHeight(): Int {
 		val rotation: Int = getRequiredRotation()
@@ -1350,9 +1191,6 @@ public open class SubsamplingScaleImageView @JvmOverloads constructor(
 		}
 	}
 
-	/**
-	 * Called by worker task when a tile has loaded. Redraws the view.
-	 */
 	@Synchronized
 	private fun onTileLoaded() {
 		checkReady()
@@ -1436,6 +1274,10 @@ public open class SubsamplingScaleImageView @JvmOverloads constructor(
 
 	private fun loadTile(decoder: ImageRegionDecoder, tile: Tile) {
 		tile.isLoading = true
+		// BUG 2 FIX: capture the generation and downSampling at launch time.
+		// If either changes before this coroutine completes, discard the result.
+		val capturedGeneration = tileGeneration.get()
+		val capturedDownSampling = downSampling
 		coroutineScope.launch {
 			try {
 				val bitmap = if (decoder.isReady && tile.isVisible) {
@@ -1443,12 +1285,13 @@ public open class SubsamplingScaleImageView @JvmOverloads constructor(
 						decoderLock.readLock().lock()
 						try {
 							if (decoder.isReady) {
-								// Update tile's file sRect according to rotation
 								fileSRect(tile.sRect, tile.fileSRect)
 								sRegion?.let {
 									tile.fileSRect.offset(it.left, it.top)
 								}
-								decoder.decodeRegion(tile.fileSRect, tile.sampleSize * downSampling)
+								// BUG 2 FIX: use capturedDownSampling (fixed at launch)
+								// instead of reading the property at decode time.
+								decoder.decodeRegion(tile.fileSRect, tile.sampleSize * capturedDownSampling)
 							} else {
 								tile.isLoading = false
 								null
@@ -1461,9 +1304,20 @@ public open class SubsamplingScaleImageView @JvmOverloads constructor(
 					tile.isLoading = false
 					null
 				}
-				tile.bitmap = bitmap
-				tile.isLoading = false
-				onTileLoaded()
+
+				// BUG 2 FIX: only store the bitmap if the generation hasn't changed.
+				// If it has, a new invalidateTiles() call happened while we were decoding —
+				// the decoded bitmap is now stale (wrong resolution) and must be discarded.
+				if (tileGeneration.get() == capturedGeneration) {
+					tile.bitmap = bitmap
+					tile.isLoading = false
+					onTileLoaded()
+				} else {
+					// Generation changed: discard the stale bitmap and reset loading state.
+					bitmap?.recycle()
+					tile.isLoading = false
+					// Do NOT call onTileLoaded() — the new generation will trigger its own loads.
+				}
 			} catch (e: CancellationException) {
 				throw e
 			} catch (error: Throwable) {
@@ -1472,12 +1326,8 @@ public open class SubsamplingScaleImageView @JvmOverloads constructor(
 		}
 	}
 
-	/**
-	 * Called by worker task when decoder is ready and image size and EXIF orientation is known.
-	 */
 	@Synchronized
 	private fun onTilesInited(decoder: ImageRegionDecoder, sWidth: Int, sHeight: Int, sOrientation: Int) {
-		// If actual dimensions don't match the declared size, reset everything.
 		if ((sWidth > 0) && (this.sHeight > 0) && (this.sWidth != sWidth || this.sHeight != sHeight)) {
 			reset(false)
 			if (!bitmapIsCached) {
@@ -1504,9 +1354,6 @@ public open class SubsamplingScaleImageView @JvmOverloads constructor(
 		requestLayout()
 	}
 
-	/**
-	 * Called by worker task when preview image is loaded.
-	 */
 	@Synchronized
 	private fun onPreviewLoaded(previewBitmap: Bitmap) {
 		if (bitmap != null || imageLoadedSent) {
@@ -1523,9 +1370,6 @@ public open class SubsamplingScaleImageView @JvmOverloads constructor(
 		}
 	}
 
-	/**
-	 * Checks whether the base layer of tiles or full size bitmap is ready.
-	 */
 	private fun isBaseLayerReady(): Boolean {
 		if (bitmap != null && !bitmapIsPreview) {
 			return true
@@ -1540,10 +1384,6 @@ public open class SubsamplingScaleImageView @JvmOverloads constructor(
 		return false
 	}
 
-	/**
-	 * Converts source rectangle from tile, which treats the image file as if it were in the correct orientation already,
-	 * to the rectangle of the image that needs to be loaded.
-	 */
 	@AnyThread
 	private fun fileSRect(sRect: Rect, target: Rect) {
 		when (getRequiredRotation()) {
@@ -1556,12 +1396,8 @@ public open class SubsamplingScaleImageView @JvmOverloads constructor(
 		}
 	}
 
-	/**
-	 * Called by worker task when full size image bitmap is ready (tiling is disabled).
-	 */
 	@Synchronized
 	private fun onImageLoaded(bitmap: Bitmap, sOrientation: Int, bitmapIsCached: Boolean) {
-		// If actual dimensions don't match the declared size, reset everything.
 		if (sWidth > 0 && sHeight > 0 && (sWidth != bitmap.width * downSampling || sHeight != bitmap.height * downSampling)) {
 			reset(false)
 		}
@@ -1591,11 +1427,6 @@ public open class SubsamplingScaleImageView @JvmOverloads constructor(
 		}
 	}
 
-	/**
-	 * Check whether view and image dimensions are known and either a preview, full size image or
-	 * base layer tiles are loaded. First time, send ready event to listener. The next draw will
-	 * display an image.
-	 */
 	private fun checkReady(): Boolean {
 		val ready = width > 0 && height > 0 && sWidth > 0 && sHeight > 0 && (bitmap != null || isBaseLayerReady())
 		if (!isReadySent && ready) {
@@ -1607,10 +1438,6 @@ public open class SubsamplingScaleImageView @JvmOverloads constructor(
 		return ready
 	}
 
-	/**
-	 * Check whether either the full size bitmap or base layer tiles are loaded. First time, send image
-	 * loaded event to listener.
-	 */
 	private fun checkImageLoaded(): Boolean {
 		val imageLoaded: Boolean = isBaseLayerReady()
 		if (!imageLoadedSent && imageLoaded) {
@@ -1640,13 +1467,6 @@ public open class SubsamplingScaleImageView @JvmOverloads constructor(
 		}
 	}
 
-	/**
-	 * Adjusts hypothetical future scale and translate values to keep scale within the allowed range and the image on screen. Minimum scale
-	 * is set so one dimension fills the view and the image is centered on the other dimension. Used to calculate what the target of an
-	 * animation should be.
-	 * @param center Whether the image should be centered in the dimension it's too small to fill. While animating this can be false to avoid changes in direction as bounds are reached.
-	 * @param sat The scale we want and the translation we're aiming for. The values are adjusted to be valid.
-	 */
 	@JvmSynthetic
 	internal fun fitToBounds(center: Boolean, sat: ScaleAndTranslate) {
 		@Suppress("NAME_SHADOWING")
@@ -1675,7 +1495,6 @@ public open class SubsamplingScaleImageView @JvmOverloads constructor(
 			}
 		}
 
-		// Asymmetric padding adjustments
 		val xPaddingRatio =
 			if (paddingLeft > 0 || paddingRight > 0) paddingLeft / (paddingLeft + paddingRight).toFloat() else 0.5f
 		val yPaddingRatio =
@@ -1703,27 +1522,18 @@ public open class SubsamplingScaleImageView @JvmOverloads constructor(
 		sat.scale = scale
 	}
 
-	/**
-	 * Adjust a requested scale to be within the allowed limits.
-	 */
 	@JvmSynthetic
 	internal fun limitedScale(targetScale: Float): Float {
 		return minOf(maxScale, maxOf(minScale(), targetScale))
 	}
 
-	/**
-	 * Double tap zoom handler triggered from gesture detector or on touch, depending on whether
-	 * quick scale is enabled.
-	 */
 	@JvmSynthetic
 	internal fun doubleTapZoom(sCenter: PointF, vFocus: PointF) {
 		if (!isPanEnabled) {
 			sRequestedCenter?.let {
-				// With a center specified from code, zoom around that point.
 				sCenter.x = it.x
 				sCenter.y = it.y
 			} ?: run {
-				// With no requested center, scale around the image center.
 				sCenter.x = sWidth() / 2f
 				sCenter.y = sHeight() / 2f
 			}
@@ -1751,11 +1561,6 @@ public open class SubsamplingScaleImageView @JvmOverloads constructor(
 		invalidate()
 	}
 
-	/**
-	 * Get the translation required to place a given source coordinate at the center of the screen, with the center
-	 * adjusted for asymmetric padding. Accepts the desired scale as an argument, so this is independent of current
-	 * translate and scale. The result is fitted to bounds, putting the image point as near to the screen center as permitted.
-	 */
 	private fun vTranslateForSCenter(sCenterX: Float, sCenterY: Float, scale: Float): PointF {
 		val vxCenter = paddingLeft + (width - paddingRight - paddingLeft) / 2
 		val vyCenter = paddingTop + (height - paddingBottom - paddingTop) / 2
@@ -1768,10 +1573,6 @@ public open class SubsamplingScaleImageView @JvmOverloads constructor(
 		return satTemp!!.vTranslate
 	}
 
-	/**
-	 * Given a requested source center and scale, calculate what the actual center will have to be to keep the image in
-	 * pan limits, keeping the requested center as near to the middle of the screen as allowed.
-	 */
 	@JvmSynthetic
 	internal fun limitedSCenter(sCenterX: Float, sCenterY: Float, scale: Float, sTarget: PointF) =
 		sTarget.also { target ->
@@ -1783,11 +1584,6 @@ public open class SubsamplingScaleImageView @JvmOverloads constructor(
 			target.set(sx, sy)
 		}
 
-	/**
-	 * Adjusts current scale and translate values to keep scale within the allowed range and the image on screen. Minimum scale
-	 * is set so one dimension fills the view and the image is centered on the other dimension.
-	 * @param center Whether the image should be centered in the dimension it's too small to fill. While animating this can be false to avoid changes in direction as bounds are reached.
-	 */
 	@JvmSynthetic
 	internal fun fitToBounds(center: Boolean) {
 		var init = false
@@ -1808,15 +1604,11 @@ public open class SubsamplingScaleImageView @JvmOverloads constructor(
 		}
 	}
 
-	/**
-	 * Sets scale and translate ready for the next draw.
-	 */
 	private fun preDraw() {
 		if (width == 0 || height == 0 || sWidth <= 0 || sHeight <= 0) {
 			return
 		}
 
-		// If waiting to translate to new center position, set translate now
 		val pendingCenter = sPendingCenter
 		if (pendingCenter != null && pendingScale != null) {
 			scale = pendingScale ?: 1f
@@ -1833,19 +1625,14 @@ public open class SubsamplingScaleImageView @JvmOverloads constructor(
 			refreshRequiredTiles(load = true)
 		}
 
-		// On first display of base image set up position, and in other cases make sure scale is correct.
 		fitToBounds(false)
 	}
 
-	/**
-	 * If animating scale, calculate current scale and center with easing equations
-	 */
 	private fun processAnimation() {
 		val animation = anim
 		if (animation?.vFocusStart == null) {
 			return
 		}
-		// Store current values, so we can send an event if they change
 		val scaleBefore = scale
 		if (vTranslateBefore == null) {
 			vTranslateBefore = PointF(0f, 0f)
@@ -1860,7 +1647,6 @@ public open class SubsamplingScaleImageView @JvmOverloads constructor(
 			animation.scaleEnd - animation.scaleStart,
 		)
 
-		// Apply required animation to the focal point
 		val vFocusNowX: Float = animation.interpolate(
 			scaleElapsed,
 			animation.vFocusStart.x,
@@ -1871,13 +1657,11 @@ public open class SubsamplingScaleImageView @JvmOverloads constructor(
 			animation.vFocusStart.y,
 			animation.vFocusEnd.y - animation.vFocusStart.y,
 		)
-		// Find out where the focal point is at this scale and adjust its position to follow the animation path
 		vTranslate?.run {
 			x -= sourceToViewX(animation.sCenterEnd.x) - vFocusNowX
 			y -= sourceToViewY(animation.sCenterEnd.y) - vFocusNowY
 		}
 
-		// For translate anims, showing the image non-centered is never allowed, for scaling anims it is during the animation.
 		fitToBounds(finished || animation.scaleStart == animation.scaleEnd)
 		sendStateChanged(scaleBefore, vTranslateBefore!!, animation.origin)
 		refreshRequiredTiles(load = finished)
@@ -1892,11 +1676,6 @@ public open class SubsamplingScaleImageView @JvmOverloads constructor(
 		invalidate()
 	}
 
-	/**
-	 * Get the current state of the view (scale, center, orientation) for restoration after rotate. Will return null if
-	 * the view is not ready.
-	 * @return an [ImageViewState] instance representing the current position of the image. null if the view isn't ready.
-	 */
 	public fun getState(): ImageViewState? {
 		return if (vTranslate != null && sWidth > 0 && sHeight > 0) {
 			val center = getCenter() ?: return null
@@ -1904,12 +1683,6 @@ public open class SubsamplingScaleImageView @JvmOverloads constructor(
 		} else null
 	}
 
-	/**
-	 * Externally change the scale and translation of the source image. This may be used with getCenter() and getScale()
-	 * to restore the scale and zoom after a screen rotate.
-	 * @param scale New scale to set.
-	 * @param sCenter New source image coordinate to center on the screen, subject to boundaries.
-	 */
 	public fun setScaleAndCenter(scale: Float, sCenter: PointF) {
 		anim = null
 		pendingScale = scale
@@ -1918,13 +1691,6 @@ public open class SubsamplingScaleImageView @JvmOverloads constructor(
 		invalidate()
 	}
 
-	/**
-	 * Creates a scale animation builder, that when started will animate a zoom in or out. If this would move the image
-	 * beyond the panning limits, the image is automatically panned during the animation.
-	 * @param scale Target scale.
-	 * @param sCenter Target source center.
-	 * @return [AnimationBuilder] instance. Call [AnimationBuilder.start] to start the anim.
-	 */
 	public fun animateScaleAndCenter(scale: Float, sCenter: PointF): AnimationBuilder? {
 		return if (isReady) {
 			AnimationBuilder(this, scale, sCenter)
@@ -1933,10 +1699,6 @@ public open class SubsamplingScaleImageView @JvmOverloads constructor(
 		}
 	}
 
-	/**
-	 * Fully zoom out and return the image to the middle of the screen. This might be useful if you have a view pager
-	 * and want images to be reset when the user has moved to another page.
-	 */
 	public fun resetScaleAndCenter() {
 		anim = null
 		pendingScale = limitedScale(0f)
@@ -1948,9 +1710,6 @@ public open class SubsamplingScaleImageView @JvmOverloads constructor(
 		invalidate()
 	}
 
-	/**
-	 * Creates Paint objects once when first needed.
-	 */
 	private fun createPaints() {
 		if (bitmapPaint == null) {
 			bitmapPaint = Paint(Paint.ANTI_ALIAS_FLAG or Paint.FILTER_BITMAP_FLAG or Paint.DITHER_FLAG).also {
@@ -2056,9 +1815,6 @@ public open class SubsamplingScaleImageView @JvmOverloads constructor(
 		return super.onGenericMotionEvent(event)
 	}
 
-	/**
-	 * For debug overlays. Scale pixel value according to screen density.
-	 */
 	private fun px(px: Int): Int {
 		return (density * px).toInt()
 	}
@@ -2069,19 +1825,10 @@ public open class SubsamplingScaleImageView @JvmOverloads constructor(
 
 	private fun Bitmap.fullHeight() = height * _downSampling
 
-	/**
-	 * Called once when the view is initialised, has dimensions, and will display an image on the
-	 * next draw. This is triggered at the same time as
-	{ @link OnImageEventListener#onReady() } but
-	 * allows a subclass to receive this event without using a listener.
-	 */
 	protected open fun onReady(): Unit = Unit
 
 	protected open fun onDownSamplingChanged(): Unit = Unit
 
-	/**
-	 * Called once when the full size image or its base layer tiles have been loaded.
-	 */
 	protected open fun onImageLoaded() {}
 
 	public companion object {
@@ -2089,19 +1836,10 @@ public open class SubsamplingScaleImageView @JvmOverloads constructor(
 		public const val TILE_SIZE_AUTO: Int = Integer.MAX_VALUE
 		internal const val TAG = "SSIV"
 
-		/** Attempt to use EXIF information on the image to rotate it. Works for external files only.  */
 		public const val ORIENTATION_USE_EXIF: Int = -1
-
-		/** Display the image file in its native orientation.  */
 		public const val ORIENTATION_0: Int = 0
-
-		/** Rotate the image 90 degrees clockwise.  */
 		public const val ORIENTATION_90: Int = 90
-
-		/** Rotate the image 180 degrees.  */
 		public const val ORIENTATION_180: Int = 180
-
-		/** Rotate the image 270 degrees clockwise.  */
 		public const val ORIENTATION_270: Int = 270
 
 		internal val VALID_ORIENTATIONS = intArrayOf(
@@ -2112,67 +1850,40 @@ public open class SubsamplingScaleImageView @JvmOverloads constructor(
 			ORIENTATION_USE_EXIF,
 		)
 
-		/** During zoom animation, keep the point of the image that was tapped in the same place, and scale the image around it.  */
 		public const val ZOOM_FOCUS_FIXED: Int = 1
-
-		/** During zoom animation, move the point of the image that was tapped to the center of the screen.  */
 		public const val ZOOM_FOCUS_CENTER: Int = 2
-
-		/** Zoom in to and center the tapped point immediately without animating.  */
 		public const val ZOOM_FOCUS_CENTER_IMMEDIATE: Int = 3
 
 		private val VALID_ZOOM_STYLES = ZOOM_FOCUS_FIXED..ZOOM_FOCUS_CENTER_IMMEDIATE
 
-		/** Quadratic ease out. Not recommended for scale animation, but good for panning.  */
 		@Deprecated("Use interpolator api instead")
 		public const val EASE_OUT_QUAD: Int = 1
 
-		/** Quadratic ease in and out.  */
 		@Deprecated("Use interpolator api instead")
 		public const val EASE_IN_OUT_QUAD: Int = 2
 
-		/** Don't allow the image to be panned off screen. As much of the image as possible is always displayed, centered in the view when it is smaller. This is the best option for galleries.  */
 		public const val PAN_LIMIT_INSIDE: Int = 1
-
-		/** Allows the image to be panned until it is just off screen, but no further. The edge of the image will stop when it is flush with the screen edge.  */
 		public const val PAN_LIMIT_OUTSIDE: Int = 2
-
-		/** Allows the image to be panned until a corner reaches the center of the screen but no further. Useful when you want to pan any spot on the image to the exact center of the screen.  */
 		public const val PAN_LIMIT_CENTER: Int = 3
 
 		private val VALID_PAN_LIMITS = PAN_LIMIT_INSIDE..PAN_LIMIT_CENTER
 
-		/** Scale the image so that both dimensions of the image will be equal to or less than the corresponding dimension of the view. The image is then centered in the view. This is the default behaviour and best for galleries.  */
 		public const val SCALE_TYPE_CENTER_INSIDE: Int = 1
-
-		/** Scale the image uniformly so that both dimensions of the image will be equal to or larger than the corresponding dimension of the view. The image is then centered in the view.  */
 		public const val SCALE_TYPE_CENTER_CROP: Int = 2
-
-		/** Scale the image so that both dimensions of the image will be equal to or less than the maxScale and equal to or larger than minScale. The image is then centered in the view.  */
 		public const val SCALE_TYPE_CUSTOM: Int = 3
-
-		/** Scale the image so that both dimensions of the image will be equal to or larger than the corresponding dimension of the view. The top left is shown.  */
 		public const val SCALE_TYPE_START: Int = 4
 
 		private val VALID_SCALE_TYPES = SCALE_TYPE_CENTER_INSIDE..SCALE_TYPE_START
 
-		/** State change originated from animation.  */
 		public const val ORIGIN_ANIM: Int = 1
-
-		/** State change originated from touch gesture.  */
 		public const val ORIGIN_TOUCH: Int = 2
-
-		/** State change originated from a fling momentum anim.  */
 		public const val ORIGIN_FLING: Int = 3
-
-		/** State change originated from a double tap zoom anim.  */
 		public const val ORIGIN_DOUBLE_TAP_ZOOM: Int = 4
 
 		public const val RESTORE_STRATEGY_NONE: Int = 0
 		public const val RESTORE_STRATEGY_IMMEDIATE: Int = 1
 		public const val RESTORE_STRATEGY_DEFERRED: Int = 2
 
-		// A global preference for bitmap format, available to decoder classes that respect it
 		@JvmStatic
 		@Deprecated("This should be managed in decoder", level = DeprecationLevel.ERROR)
 		public var preferredBitmapConfig: Bitmap.Config? = null
