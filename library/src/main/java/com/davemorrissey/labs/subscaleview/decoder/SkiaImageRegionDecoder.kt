@@ -19,17 +19,24 @@ import java.util.zip.ZipFile
 
 /**
  * Default implementation of [com.davemorrissey.labs.subscaleview.decoder.ImageRegionDecoder]
- * using Android's [android.graphics.BitmapRegionDecoder], based on the Skia library. This
- * works well in most circumstances and has reasonable performance due to the cached decoder instance,
- * however it has some problems with grayscale, indexed and CMYK images.
+ * using Android's [android.graphics.BitmapRegionDecoder], based on the Skia library.
  *
- * A [ReadWriteLock] is used to delegate responsibility for multi threading behaviour to the
- * [BitmapRegionDecoder] instance on SDK &gt;= 21, whilst allowing this class to block until no
- * tiles are being loaded before recycling the decoder. In practice, [BitmapRegionDecoder] is
- * synchronized internally so this has no real impact on performance.
+ * Improvements over the original:
+ * - Default bitmap config changed to [Bitmap.Config.ARGB_8888].
+ *   The original defaulted to RGB_565. While RGB_565 uses half the memory, it
+ *   produces visible colour banding on manga pages that contain gradients, skin tones,
+ *   or subtle shading — exactly the content Kotatsu displays. ARGB_8888 produces
+ *   correct colours and is the Android system default for BitmapRegionDecoder.
+ *   Callers that explicitly need RGB_565 (e.g., thumbnail grids) can pass it via Factory.
+ * - ReadWriteLock is used identically to the original for thread-safe concurrent reads.
  */
 public class SkiaImageRegionDecoder @JvmOverloads constructor(
-	private val bitmapConfig: Bitmap.Config = Bitmap.Config.RGB_565,
+	// BUG 2 / QUALITY FIX: changed default from RGB_565 to ARGB_8888.
+	// RGB_565 was the source of the "image looks de-sharpened / washed out" appearance
+	// even on fresh loads — 16-bit colour depth discards the low bits of every channel,
+	// producing visible banding on smooth gradients. ARGB_8888 is correct quality for
+	// manga content.
+	private val bitmapConfig: Bitmap.Config = Bitmap.Config.ARGB_8888,
 ) : ImageRegionDecoder {
 
 	private var decoder: BitmapRegionDecoder? = null
@@ -125,16 +132,14 @@ public class SkiaImageRegionDecoder @JvmOverloads constructor(
 		}
 	}
 
-	/**
-	 * Before SDK 21, BitmapRegionDecoder was not synchronized internally. Any attempt to decode
-	 * regions from multiple threads with one decoder instance causes a segfault. For old versions
-	 * use the write lock to enforce single threaded decoding.
-	 */
 	private val decodeLock: Lock
 		get() = decoderLock.readLock()
 
 	public class Factory @JvmOverloads constructor(
-		override val bitmapConfig: Bitmap.Config = Bitmap.Config.RGB_565,
+		// QUALITY FIX: default to ARGB_8888 for correct colour depth on manga tiles.
+		// Pass RGB_565 explicitly only if you need aggressive memory savings and
+		// accept visible colour banding (e.g., very low-end devices with <512 MB RAM).
+		override val bitmapConfig: Bitmap.Config = Bitmap.Config.ARGB_8888,
 	) : DecoderFactory<SkiaImageRegionDecoder> {
 
 		override fun make(): SkiaImageRegionDecoder {
