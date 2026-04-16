@@ -10,17 +10,17 @@ archivesBaseName = 'subsampling-scale-image-view-androidx'
 version = '4.2.3'
 
 android {
-    compileSdk = 34
+    compileSdk = 36
     namespace = 'com.davemorrissey.labs.subscaleview'
-    
-    // This must be INSIDE the android block
+
+    // Required by the maven-publish plugin to know which variant to publish.
     publishing {
         singleVariant("release")
     }
-	
+
     defaultConfig {
         minSdk = 23
-        targetSdk = 34
+        targetSdk = 36
         consumerProguardFiles 'proguard-rules.txt'
     }
 
@@ -40,7 +40,7 @@ android {
             proguardFiles getDefaultProguardFile('proguard-android-optimize.txt'), 'proguard-rules.pro'
         }
     }
-} // This brace correctly closes the android block
+}
 
 configurations {
     javadocs
@@ -49,11 +49,11 @@ configurations {
 dependencies {
     implementation 'org.jetbrains.kotlin:kotlin-stdlib:2.3.20'
     implementation "androidx.customview:customview:1.2.0"
-    javadocs 'androidx.annotation:annotation:1.10.0'
-    javadocs 'androidx.exifinterface:exifinterface:1.4.2'
-    implementation 'androidx.annotation:annotation:1.10.0'
-    implementation 'androidx.exifinterface:exifinterface:1.4.2'
-    implementation 'androidx.lifecycle:lifecycle-runtime-ktx:2.10.0'
+    javadocs 'androidx.annotation:annotation:1.10.1'
+    javadocs 'androidx.exifinterface:exifinterface:1.4.1'
+    implementation 'androidx.annotation:annotation:1.10.1'
+    implementation 'androidx.exifinterface:exifinterface:1.4.1'
+    implementation 'androidx.lifecycle:lifecycle-runtime-ktx:2.9.1'
     implementation 'org.jetbrains.kotlinx:kotlinx-coroutines-android:1.10.2'
 }
 
@@ -70,7 +70,6 @@ afterEvaluate {
     }
 }
 
-// Cleaned up Javadoc task to prevent "Unexpected input" errors
 task javadoc(type: Javadoc) {
     failOnError false
     source = android.sourceSets.main.java.sourceFiles
