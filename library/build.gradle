@@ -7,13 +7,12 @@ plugins {
 
 group = 'com.davemorrissey.labs'
 archivesBaseName = 'subsampling-scale-image-view-androidx'
-version = '4.2.6'
+version = '4.2.7'
 
 android {
     compileSdk = 36
     namespace = 'com.davemorrissey.labs.subscaleview'
 
-    // Required by the maven-publish plugin to know which variant to publish.
     publishing {
         singleVariant("release")
     }
@@ -47,7 +46,7 @@ configurations {
 }
 
 dependencies {
-    implementation 'org.jetbrains.kotlin:kotlin-stdlib:2.2.10'
+    implementation 'org.jetbrains.kotlin:kotlin-stdlib:2.3.20'
     implementation "androidx.customview:customview:1.2.0"
     javadocs 'androidx.annotation:annotation:1.10.0'
     javadocs 'androidx.exifinterface:exifinterface:1.4.1'
@@ -64,7 +63,7 @@ afterEvaluate {
                 from components.release
                 groupId = 'com.github.Ero-gamer'
                 artifactId = 'subsampling-scale-image-view-androidx'
-                version = '4.2.6'
+                version = '4.2.7'
             }
         }
     }
