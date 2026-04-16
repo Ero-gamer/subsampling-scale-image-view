@@ -7,7 +7,7 @@ plugins {
 
 group = 'com.davemorrissey.labs'
 archivesBaseName = 'subsampling-scale-image-view-androidx'
-version = '4.2.3'
+version = '4.2.5'
 
 android {
     compileSdk = 36
@@ -47,7 +47,7 @@ configurations {
 }
 
 dependencies {
-    implementation 'org.jetbrains.kotlin:kotlin-stdlib:2.3.20'
+    implementation 'org.jetbrains.kotlin:kotlin-stdlib:2.2.10'
     implementation "androidx.customview:customview:1.2.0"
     javadocs 'androidx.annotation:annotation:1.10.1'
     javadocs 'androidx.exifinterface:exifinterface:1.4.1'
@@ -64,7 +64,7 @@ afterEvaluate {
                 from components.release
                 groupId = 'com.github.Ero-gamer'
                 artifactId = 'subsampling-scale-image-view-androidx'
-                version = '4.2.3'
+                version = '4.2.5'
             }
         }
     }
