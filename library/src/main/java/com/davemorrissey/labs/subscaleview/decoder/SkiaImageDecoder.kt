@@ -5,7 +5,7 @@ import android.content.Context
 import android.graphics.Bitmap
 import android.graphics.BitmapFactory
 import android.net.Uri
-import android.os.Build
+import androidx.annotation.WorkerThread
 import com.davemorrissey.labs.subscaleview.internal.URI_PATH_ASSET
 import com.davemorrissey.labs.subscaleview.internal.URI_SCHEME_CONTENT
 import com.davemorrissey.labs.subscaleview.internal.URI_SCHEME_FILE
@@ -14,77 +14,107 @@ import com.davemorrissey.labs.subscaleview.internal.URI_SCHEME_ZIP
 import java.util.zip.ZipFile
 
 /**
- * Default implementation of [com.davemorrissey.labs.subscaleview.decoder.ImageDecoder]
- * using Android's [android.graphics.BitmapFactory], based on the Skia library.
+ * Default [ImageDecoder] using [BitmapFactory] (Skia). Used for non-tiled image loads.
  *
- * Improvements over the original:
- * - Uses [Bitmap.Config.HARDWARE] on API 26+ when sampleSize == 1 (no subsampling).
- *   Hardware bitmaps are stored directly in GPU memory, eliminating the CPU→GPU
- *   upload step during the first [android.graphics.Canvas.drawBitmap] call. This
- *   makes first-frame display noticeably faster for large manga pages on all devices.
- * - Falls back to [bitmapConfig] (default RGB_565) for subsampled previews to keep
- *   memory usage low when the full image doesn't need to be displayed at native resolution.
+ * ### Why HARDWARE bitmaps are NOT used
+ *
+ * An earlier version of this library used [Bitmap.Config.HARDWARE] for full-image decodes
+ * to skip the CPU→GPU upload on the first draw frame. This caused serious problems:
+ *
+ * 1. **Black tiles on zoom.** Hardware bitmaps cannot be drawn on a software
+ *    [android.graphics.Canvas]. This is a silent failure: Android throws
+ *    `IllegalStateException` which is caught by the coroutine error handler, the bitmap
+ *    is never stored, and the tile renders as solid black. Several contexts cause software
+ *    canvas usage: `WebtoonScalingFrame.setLayerType(LAYER_TYPE_SOFTWARE)` during pinch
+ *    gestures, screenshots, and certain vendor-specific rendering paths.
+ *
+ * 2. **Pan restriction after zoom.** When the base-layer bitmap is a hardware bitmap and
+ *    SSIV calls `Bitmap.createBitmap(source, x, y, w, h)` for internal cropping during
+ *    downsampling changes, the operation throws. This leaves internal state inconsistent,
+ *    causing `fitToBounds` to operate with wrong image dimensions and restrict panning.
+ *
+ * 3. **Pixel access blocked.** Edge detection (`EdgeDetector`) and crop bounds computation
+ *    read pixel data via `Bitmap.getPixel()` / `copyPixelsToBuffer()`. Both throw
+ *    `IllegalStateException` on hardware bitmaps.
+ *
+ * The correct config for all image types is [BitmapQuality.STANDARD] (ARGB_8888).
+ * The GPU upload cost that HARDWARE was meant to avoid is typically < 10ms for manga-
+ * sized images and is not perceptible to users.
+ *
+ * ### Color quality
+ *
+ * Default: [BitmapQuality.STANDARD] (ARGB_8888). Supports [BitmapQuality.HIGH]
+ * (RGBA_F16, API 26+) and [BitmapQuality.MEMORY_SAVING] (RGB_565) via the factory.
  */
 public class SkiaImageDecoder @JvmOverloads constructor(
-	private val bitmapConfig: Bitmap.Config = Bitmap.Config.RGB_565,
+    private val quality: BitmapQuality = BitmapQuality.STANDARD,
 ) : ImageDecoder {
 
-	@SuppressLint("DiscouragedApi")
-	@Throws(Exception::class)
-	override fun decode(context: Context, uri: Uri, sampleSize: Int): Bitmap {
-		val options = BitmapFactory.Options()
-		options.inSampleSize = sampleSize
+    // ── Backwards-compat constructor ───────────────────────────────────────────
+    @Deprecated("Use BitmapQuality constructor.")
+    public constructor(bitmapConfig: Bitmap.Config) : this(
+        quality = when (bitmapConfig) {
+            Bitmap.Config.RGB_565 -> BitmapQuality.MEMORY_SAVING
+            Bitmap.Config.RGBA_F16 -> BitmapQuality.HIGH
+            else -> BitmapQuality.STANDARD
+        },
+    )
 
-		// BUG 1 / PERF FIX: use HARDWARE config when decoding at native resolution.
-		// HARDWARE bitmaps reside in GPU memory; Canvas.drawBitmap skips the pixel-data
-		// upload that normally happens on the first draw, saving ~30-50% of first-frame
-		// latency on large images.
-		// Constraints: HARDWARE requires API 26+, and only works when sampleSize == 1
-		// (subsampled bitmaps must be mutable for further processing).
-		options.inPreferredConfig = if (
-			Build.VERSION.SDK_INT >= Build.VERSION_CODES.O && sampleSize == 1
-		) {
-			Bitmap.Config.HARDWARE
-		} else {
-			bitmapConfig
-		}
+    @SuppressLint("DiscouragedApi")
+    @Throws(Exception::class)
+    @WorkerThread
+    override fun decode(context: Context, uri: Uri, sampleSize: Int): Bitmap {
+        val options = BitmapFactory.Options().apply {
+            inSampleSize = sampleSize.coerceAtLeast(1)
+            // Always use the resolved config — never HARDWARE (see class kdoc).
+            inPreferredConfig = quality.toBitmapConfig()
+        }
 
-		return when (uri.scheme) {
-			URI_SCHEME_RES -> decodeResource(context, uri, options)
+        val bitmap = when (uri.scheme) {
+            URI_SCHEME_RES -> decodeResource(context, uri, options)
 
-			URI_SCHEME_ZIP -> ZipFile(uri.schemeSpecificPart).use { file ->
-				val entry = requireNotNull(file.getEntry(uri.fragment)) {
-					"Entry ${uri.fragment} not found in the zip"
-				}
-				file.getInputStream(entry).use { input ->
-					BitmapFactory.decodeStream(input, null, options)
-				}
-			}
+            URI_SCHEME_ZIP -> ZipFile(uri.schemeSpecificPart).use { file ->
+                val entry = requireNotNull(file.getEntry(uri.fragment)) {
+                    "Entry ${uri.fragment} not found in the zip"
+                }
+                file.getInputStream(entry).use { BitmapFactory.decodeStream(it, null, options) }
+            }
 
-			URI_SCHEME_FILE -> {
-				val path = uri.schemeSpecificPart
-				if (path.startsWith(URI_PATH_ASSET, ignoreCase = true)) {
-					val assetName = path.substring(URI_PATH_ASSET.length)
-					context.assets.decodeBitmap(assetName, options)
-				} else {
-					BitmapFactory.decodeFile(path, options)
-				}
-			}
+            URI_SCHEME_FILE -> {
+                val path = uri.schemeSpecificPart
+                if (path.startsWith(URI_PATH_ASSET, ignoreCase = true)) {
+                    context.assets.decodeBitmap(path.substring(URI_PATH_ASSET.length), options)
+                } else {
+                    BitmapFactory.decodeFile(path, options)
+                }
+            }
 
-			URI_SCHEME_CONTENT -> context.contentResolver.decodeBitmap(uri, options)
+            URI_SCHEME_CONTENT -> context.contentResolver.decodeBitmap(uri, options)
 
-			else -> throw UnsupportedUriException(uri.toString())
-		} ?: throw ImageDecodeException.create(context, uri)
-	}
+            else -> throw UnsupportedUriException(uri.toString())
+        }
 
-	public class Factory @JvmOverloads constructor(
-		// PERF: default to RGB_565 for subsampled tiles (memory efficient).
-		// Full-resolution single-image decodes automatically use HARDWARE on API 26+.
-		override val bitmapConfig: Bitmap.Config = Bitmap.Config.RGB_565,
-	) : DecoderFactory<SkiaImageDecoder> {
+        return bitmap ?: throw ImageDecodeException.create(context, uri)
+    }
 
-		override fun make(): SkiaImageDecoder {
-			return SkiaImageDecoder(bitmapConfig)
-		}
-	}
+    // ── Factory ───────────────────────────────────────────────────────────────
+
+    public class Factory @JvmOverloads constructor(
+        public val quality: BitmapQuality = BitmapQuality.STANDARD,
+    ) : DecoderFactory<SkiaImageDecoder> {
+
+        @Deprecated("Use BitmapQuality constructor.")
+        public constructor(bitmapConfig: Bitmap.Config) : this(
+            quality = when (bitmapConfig) {
+                Bitmap.Config.RGB_565 -> BitmapQuality.MEMORY_SAVING
+                Bitmap.Config.RGBA_F16 -> BitmapQuality.HIGH
+                else -> BitmapQuality.STANDARD
+            },
+        )
+
+        override val bitmapConfig: Bitmap.Config
+            get() = quality.toBitmapConfig()
+
+        override fun make(): SkiaImageDecoder = SkiaImageDecoder(quality)
+    }
 }

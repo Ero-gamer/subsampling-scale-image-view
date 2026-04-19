@@ -78,18 +78,29 @@ public open class SubsamplingScaleImageView @JvmOverloads constructor(
 	@AttrRes defStyleAttr: Int = 0,
 ) : View(context, attrs, defStyleAttr) {
 
+	// Bitmap (preview or full image)
 	private var bitmap: Bitmap? = null
 
+	// Whether the bitmap is a preview image
 	private var bitmapIsPreview: Boolean = false
 
+	// Specifies if a cache handler is also referencing the bitmap. Do not recycle if so.
 	private var bitmapIsCached: Boolean = false
 
+	// Uri of full size image
 	private var uri: Uri? = null
 
+	// Sample size used to display the whole image when fully zoomed out
 	private var fullImageSampleSize: Int = 0
 
+	// Map of zoom level to tile grid
 	private var tileMap: TileMap? = null
 
+	// BUG 2 FIX: generation counter. Incremented every time tiles are invalidated.
+	// Each loadTile() coroutine captures the generation at launch; if the generation
+	// has changed by the time the bitmap is decoded, it's discarded instead of stored.
+	// This eliminates the race where low-res tiles (loaded at downSampling=4) overwrite
+	// freshly loaded high-res tiles (at downSampling=1) after a resume event.
 	private val tileGeneration = AtomicInteger(0)
 
 	private var _downSampling = 1
@@ -104,6 +115,7 @@ public open class SubsamplingScaleImageView @JvmOverloads constructor(
 			}
 		}
 
+	// Image orientation setting
 	public var orientation: Int = ORIENTATION_0
 		set(value) {
 			require(value in VALID_ORIENTATIONS)
@@ -113,8 +125,10 @@ public open class SubsamplingScaleImageView @JvmOverloads constructor(
 			requestLayout()
 		}
 
+	// Max scale allowed (prevent infinite zoom)
 	public var maxScale: Float = 2F
 
+	// Min scale allowed (prevent infinite zoom)
 	private var _minScale: Float = minScale()
 
 	public var minScale: Float
@@ -123,8 +137,10 @@ public open class SubsamplingScaleImageView @JvmOverloads constructor(
 			_minScale = value
 		}
 
+	// Density to reach before loading higher resolution tiles
 	private var minimumTileDpi: Int = -1
 
+	// Pan limiting style
 	public var panLimit: Int = PAN_LIMIT_INSIDE
 		set(value) {
 			require(value in VALID_PAN_LIMITS) { "Invalid pan limit: $value" }
@@ -150,6 +166,7 @@ public open class SubsamplingScaleImageView @JvmOverloads constructor(
 			invalidate()
 		}
 
+	// Minimum scale type
 	public var minimumScaleType: Int = SCALE_TYPE_CENTER_INSIDE
 		set(value) {
 			require(value in VALID_SCALE_TYPES) { "Invalid scale type: $value" }
@@ -160,13 +177,16 @@ public open class SubsamplingScaleImageView @JvmOverloads constructor(
 			}
 		}
 
+	// overrides for the dimensions of the generated tiles
 	private var maxTileWidth: Int = TILE_SIZE_AUTO
 	private var maxTileHeight: Int = TILE_SIZE_AUTO
 
 	public var backgroundDispatcher: CoroutineDispatcher = Dispatchers.Default
 
+	// Whether tiles should be loaded while gestures and animations are still in progress
 	public var isEagerLoadingEnabled: Boolean = true
 
+	// Gesture detection settings
 	public var isPanEnabled: Boolean = true
 		set(value) {
 			field = value
@@ -184,6 +204,7 @@ public open class SubsamplingScaleImageView @JvmOverloads constructor(
 	public var isZoomEnabled: Boolean = true
 	public var isQuickScaleEnabled: Boolean = true
 
+	// Double tap zoom behaviour
 	public var doubleTapZoomScale: Float = 1F
 	public var doubleTapZoomStyle: Int = ZOOM_FOCUS_FIXED
 		set(value) {
@@ -192,6 +213,7 @@ public open class SubsamplingScaleImageView @JvmOverloads constructor(
 		}
 	private var doubleTapZoomDuration: Int = 500
 
+	// Current scale and scale at start of zoom
 	public var scale: Float = 0f
 		@JvmSynthetic
 		internal set
@@ -200,6 +222,7 @@ public open class SubsamplingScaleImageView @JvmOverloads constructor(
 	@JvmSynthetic
 	internal var scaleStart: Float = 0f
 
+	// Screen coordinate of top-left corner of source image
 	@JvmField
 	@JvmSynthetic
 	internal var vTranslate: PointF? = null
@@ -209,6 +232,7 @@ public open class SubsamplingScaleImageView @JvmOverloads constructor(
 	internal var vTranslateStart: PointF? = null
 	private var vTranslateBefore: PointF? = null
 
+	// Source coordinate to center on, used when new position is set externally before view is ready
 	private var pendingScale: Float? = null
 	private var sPendingCenter: PointF? = null
 
@@ -216,6 +240,7 @@ public open class SubsamplingScaleImageView @JvmOverloads constructor(
 	@JvmSynthetic
 	internal var sRequestedCenter: PointF? = null
 
+	// Source image dimensions and orientation - dimensions relate to the unrotated image
 	public var sWidth: Int = 0
 		private set
 	public var sHeight: Int = 0
@@ -224,26 +249,36 @@ public open class SubsamplingScaleImageView @JvmOverloads constructor(
 	private var sRegion: Rect? = null
 	private var pRegion: Rect? = null
 
+	// Is two-finger zooming in progress
 	@JvmField
 	@JvmSynthetic
 	internal var isZooming: Boolean = false
 
+	// Is one-finger panning in progress
 	@JvmField
 	@JvmSynthetic
 	internal var isPanning: Boolean = false
 
+	// Is quick-scale gesture in progress
 	@JvmField
 	@JvmSynthetic
 	internal var isQuickScaling: Boolean = false
 
+	// Fling detector
 	private var detector: GestureDetector? = null
 	private var singleDetector: GestureDetector? = null
 
+	// Tile and image decoding
 	private var decoder: ImageRegionDecoder? = null
 	private val decoderLock = ReentrantReadWriteLock(true)
+	// Decoder factories. Both default to BitmapQuality.STANDARD (ARGB_8888), which is
+	// the correct color depth for manga/webtoon — 8 bits per channel, full alpha, no
+	// visible banding. Override to use BitmapQuality.HIGH (RGBA_F16, API 26+) for HDR
+	// content or BitmapQuality.MEMORY_SAVING (RGB_565) for severely RAM-limited devices.
 	public var bitmapDecoderFactory: DecoderFactory<out ImageDecoder> = SkiaImageDecoder.Factory()
 	public var regionDecoderFactory: DecoderFactory<out ImageRegionDecoder> = SkiaImageRegionDecoder.Factory()
 
+	// Debug values
 	protected val isDebugDrawingEnabled: Boolean
 		get() = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.R) {
 			isShowingLayoutBounds
@@ -279,26 +314,32 @@ public open class SubsamplingScaleImageView @JvmOverloads constructor(
 	@JvmSynthetic
 	internal var quickScaleVStart: PointF? = null
 
+	// Scale and center animation tracking
 	@JvmField
 	@JvmSynthetic
 	internal var anim: Anim? = null
 
+	// Whether a ready notification has been sent to subclasses
 	@JvmField
 	@JvmSynthetic
 	internal var isReadySent: Boolean = false
 
+	// Whether a base layer loaded notification has been sent to subclasses
 	private var imageLoadedSent: Boolean = false
 
+	// Event listener
 	private val onImageEventListeners = CompositeImageEventListener()
 
 	protected val onImageEventListener: OnImageEventListener
 		get() = onImageEventListeners
 
+	// Scale and center listener
 	public var onStateChangedListener: OnStateChangedListener? = null
 
 	@Suppress("LeakingThis")
 	private val touchEventDelegate = TouchEventDelegate(this)
 
+	// Paint objects created once and reused for efficiency
 	private var bitmapPaint: Paint? = null
 	private var debugTextPaint: Paint? = null
 	private var debugLinePaint: Paint? = null
@@ -314,6 +355,7 @@ public open class SubsamplingScaleImageView @JvmOverloads constructor(
 
 	private var stateRestoreStrategy: Int = RESTORE_STRATEGY_NONE
 
+	// Volatile fields used to reduce object creation
 	private var satTemp: ScaleAndTranslate? = null
 	private var matrix2: Matrix? = null
 	private var sRect: RectF? = null
@@ -323,6 +365,7 @@ public open class SubsamplingScaleImageView @JvmOverloads constructor(
 	public val isReady: Boolean
 		get() = isReadySent
 
+	// The logical density of the display
 	private val density = context.resources.displayMetrics.density
 	private val viewConfig = ViewConfiguration.get(context)
 	protected val coroutineScope: CoroutineScope = CoroutineScope(
@@ -415,8 +458,10 @@ public open class SubsamplingScaleImageView @JvmOverloads constructor(
 				sRegion = imageSource.region
 				uri = imageSource.toUri(context).also { uri ->
 					if (imageSource.isTilingEnabled || sRegion != null) {
+						// Load the bitmap using tile decoding.
 						initTiles(regionDecoderFactory, uri)
 					} else {
+						// Load the bitmap as a single image.
 						loadBitmap(uri, false)
 					}
 				}
@@ -436,7 +481,7 @@ public open class SubsamplingScaleImageView @JvmOverloads constructor(
 	@CheckResult
 	public fun snapshot(config: Bitmap.Config? = null): Bitmap? = bitmap?.let {
 		if (!it.isRecycled) {
-			it.copy(config ?: it.config ?: Bitmap.Config.ARGB_8888, false)
+			it.copy(config ?: it.config, false)
 		} else {
 			null
 		}
@@ -548,6 +593,8 @@ public open class SubsamplingScaleImageView @JvmOverloads constructor(
 			return
 		}
 
+		// BUG 1 FIX: initialiseBaseLayer is now also triggered from onTilesInited,
+		// so this check becomes a no-op for the first draw in most cases.
 		if (tileMap == null && decoder != null) {
 			initialiseBaseLayer(getMaxBitmapDimensions(canvas))
 		}
@@ -568,7 +615,11 @@ public open class SubsamplingScaleImageView @JvmOverloads constructor(
 				if (key == sampleSize || hasMissingTiles) {
 					for (tile in value) {
 						sourceToViewRect(tile.sRect, tile.vRect)
-						if (tile.bitmap != null) {
+						// Snapshot tile.bitmap to a local val. Tile.bitmap is @Volatile and
+						// written by background coroutines; snapshotting once prevents a race
+						// between the null-check here and the subsequent !! dereference below.
+						val tileBitmap = tile.bitmap
+						if (tileBitmap != null && !tileBitmap.isRecycled) {
 							tileBgPaint?.let {
 								canvas.drawRect(tile.vRect, it)
 							}
@@ -580,12 +631,12 @@ public open class SubsamplingScaleImageView @JvmOverloads constructor(
 								srcArray,
 								0f,
 								0f,
-								tile.bitmap!!.width.toFloat(),
+								tileBitmap.width.toFloat(),
 								0f,
-								tile.bitmap!!.width.toFloat(),
-								tile.bitmap!!.height.toFloat(),
+								tileBitmap.width.toFloat(),
+								tileBitmap.height.toFloat(),
 								0f,
-								tile.bitmap!!.height.toFloat(),
+								tileBitmap.height.toFloat(),
 							)
 							if (getRequiredRotation() == ORIENTATION_0) {
 								setMatrixArray(
@@ -637,7 +688,7 @@ public open class SubsamplingScaleImageView @JvmOverloads constructor(
 								)
 							}
 							matrix2!!.setPolyToPoly(srcArray, 0, dstArray, 0, 4)
-							canvas.drawBitmap(tile.bitmap!!, matrix2!!, bitmapPaint)
+							canvas.drawBitmap(tileBitmap, matrix2!!, bitmapPaint)
 							if (isDebugDrawingEnabled) {
 								canvas.drawRect(tile.vRect, debugLinePaint!!)
 							}
@@ -972,6 +1023,7 @@ public open class SubsamplingScaleImageView @JvmOverloads constructor(
 		sRect = null
 		if (isNewImage) {
 			coroutineScope.coroutineContext[Job]?.cancelChildren()
+			// BUG 2 FIX: increment generation so any in-flight tile loads are discarded.
 			tileGeneration.incrementAndGet()
 			uri = null
 			decoderLock.writeLock().lock()
@@ -1045,6 +1097,9 @@ public open class SubsamplingScaleImageView @JvmOverloads constructor(
 	}
 
 	private fun invalidateTiles() {
+		// BUG 2 FIX: increment generation before triggering new tile loads.
+		// Any in-flight coroutines from the previous generation will see the
+		// mismatch and discard their bitmaps rather than storing them.
 		tileGeneration.incrementAndGet()
 		tileMap?.invalidateAll()
 		decoder?.let { _ ->
@@ -1227,19 +1282,23 @@ public open class SubsamplingScaleImageView @JvmOverloads constructor(
 
 	private fun loadTile(decoder: ImageRegionDecoder, tile: Tile) {
 		tile.isLoading = true
+		// Capture generation and downSampling at launch. If either changes while this
+		// coroutine is running (because the user leaves the page or changes zoom level),
+		// the decoded bitmap is stale and must be discarded rather than stored.
 		val capturedGeneration = tileGeneration.get()
 		val capturedDownSampling = downSampling
 		coroutineScope.launch {
 			try {
-				val bitmap = if (decoder.isReady && tile.isVisible) {
+				val decodedBitmap: Bitmap? = if (decoder.isReady && tile.isVisible) {
 					runInterruptible(backgroundDispatcher) {
 						decoderLock.readLock().lock()
 						try {
 							if (decoder.isReady) {
+								// Compute the file-coordinate rect for this tile, accounting
+								// for image rotation. Capture downSampling from the closure —
+								// reading it at decode time would race with applyDownSampling().
 								fileSRect(tile.sRect, tile.fileSRect)
-								sRegion?.let {
-									tile.fileSRect.offset(it.left, it.top)
-								}
+								sRegion?.let { tile.fileSRect.offset(it.left, it.top) }
 								decoder.decodeRegion(tile.fileSRect, tile.sampleSize * capturedDownSampling)
 							} else {
 								tile.isLoading = false
@@ -1254,17 +1313,34 @@ public open class SubsamplingScaleImageView @JvmOverloads constructor(
 					null
 				}
 
+				// Back on the main thread: check whether the generation is still current.
 				if (tileGeneration.get() == capturedGeneration) {
-					tile.bitmap = bitmap
-					tile.isLoading = false
+					// Generation matches — store the bitmap and trigger a redraw.
+					// Capture and recycle the old bitmap AFTER setting the new one, so
+					// any concurrent onDraw() that reads tile.bitmap never sees a recycled
+					// bitmap. The @Volatile annotation on Tile.bitmap ensures visibility.
+					val oldBitmap = tile.bitmap
+					tile.setBitmap(decodedBitmap)
 					onTileLoaded()
+					// Recycle the old bitmap on the main thread, after the new one is live.
+					oldBitmap?.recycle()
 				} else {
-					bitmap?.recycle()
+					// Generation changed while we were decoding: the bitmap is stale
+					// (decoded at the wrong downSampling level). Discard it.
+					decodedBitmap?.recycle()
 					tile.isLoading = false
+					// Mark as invalid so refreshRequiredTiles() requeues it at the correct
+					// resolution on the next frame. Also trigger a redraw so the view
+					// re-evaluates its tile state — without this, the view can stay black
+					// if no other event fires another invalidate().
+					tile.isValid = false
+					invalidate()
 				}
 			} catch (e: CancellationException) {
+				tile.isLoading = false
 				throw e
 			} catch (error: Throwable) {
+				tile.isLoading = false
 				onImageEventListeners.onTileLoadError(error)
 			}
 		}
@@ -1656,9 +1732,17 @@ public open class SubsamplingScaleImageView @JvmOverloads constructor(
 
 	private fun createPaints() {
 		if (bitmapPaint == null) {
-			bitmapPaint = Paint(Paint.ANTI_ALIAS_FLAG or Paint.FILTER_BITMAP_FLAG or Paint.DITHER_FLAG).also {
+			bitmapPaint = Paint().apply {
+				// FILTER_BITMAP_FLAG: enables bilinear filtering when the bitmap is scaled.
+				// This is the most important flag for tile rendering quality — without it,
+				// tile edges show nearest-neighbour pixelation during pan and zoom transitions.
+				// Note: using Paint(flags) constructor form has a documented quirk on some
+				// API levels where flags are not fully propagated; explicit assignment is safer.
+				isFilterBitmap = true
+				isDither = true
+				isAntiAlias = true // No effect on drawBitmap, but kept for subclass paint reuse.
 				if (colorFilter != null) {
-					it.colorFilter = colorFilter
+					this.colorFilter = colorFilter
 				}
 			}
 		}

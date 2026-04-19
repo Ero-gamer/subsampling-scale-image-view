@@ -43,8 +43,18 @@ import kotlin.concurrent.thread
  *
  */
 public open class SkiaPooledImageRegionDecoder @JvmOverloads constructor(
-	private val bitmapConfig: Bitmap.Config = Bitmap.Config.RGB_565,
+	private val quality: BitmapQuality = BitmapQuality.STANDARD,
 ) : ImageRegionDecoder {
+
+	// Backwards-compat: accept Bitmap.Config directly
+	@Deprecated("Use BitmapQuality constructor.")
+	public constructor(bitmapConfig: Bitmap.Config) : this(
+		quality = when (bitmapConfig) {
+			Bitmap.Config.RGB_565 -> BitmapQuality.MEMORY_SAVING
+			Bitmap.Config.RGBA_F16 -> BitmapQuality.HIGH
+			else -> BitmapQuality.STANDARD
+		},
+	)
 
 	private var decoderPool: DecoderPool? = DecoderPool()
 	private val decoderLock: ReadWriteLock = ReentrantReadWriteLock(true)
@@ -208,7 +218,7 @@ public open class SkiaPooledImageRegionDecoder @JvmOverloads constructor(
 	 */
 	@WorkerThread
 	override fun decodeRegion(sRect: Rect, sampleSize: Int): Bitmap {
-		debug("Decode region " + sRect + " on thread " + Thread.currentThread().name)
+		debug("Decode region $sRect on thread ${Thread.currentThread().name}")
 		if (sRect.width() < imageDimensions.x || sRect.height() < imageDimensions.y) {
 			lazyInit()
 		}
@@ -219,10 +229,23 @@ public open class SkiaPooledImageRegionDecoder @JvmOverloads constructor(
 				try {
 					// Decoder can't be null or recycled in practice
 					if (decoder != null && !decoder.isRecycled) {
-						val options = BitmapFactory.Options()
-						options.inSampleSize = sampleSize
-						options.inPreferredConfig = bitmapConfig
-						return decoder.decodeRegion(sRect, options) ?: throw ImageDecodeException.create(context, uri)
+						val options = BitmapFactory.Options().apply {
+							inSampleSize = sampleSize.coerceAtLeast(1)
+							inPreferredConfig = quality.toBitmapConfig()
+						}
+
+						// Apply chroma block alignment to fix green/blue bars on large images.
+						// See SkiaImageRegionDecoder for full explanation.
+						val iw = imageDimensions.x
+						val ih = imageDimensions.y
+						if (sRect.isChromaAligned(iw, ih)) {
+							return decoder.decodeRegion(sRect, options)
+								?: throw ImageDecodeException.create(context, uri)
+						}
+						val aligned = sRect.alignToChromaBlocks(iw, ih)
+						val rawBitmap = decoder.decodeRegion(aligned, options)
+							?: throw ImageDecodeException.create(context, uri)
+						return cropToRequestedRegion(rawBitmap, sRect, aligned, options.inSampleSize)
 					}
 				} finally {
 					if (decoder != null) {
@@ -299,11 +322,23 @@ public open class SkiaPooledImageRegionDecoder @JvmOverloads constructor(
 	}
 
 	public class Factory @JvmOverloads constructor(
-		override val bitmapConfig: Bitmap.Config = Bitmap.Config.RGB_565,
+		public val quality: BitmapQuality = BitmapQuality.STANDARD,
 	) : DecoderFactory<SkiaPooledImageRegionDecoder> {
 
+		@Deprecated("Use BitmapQuality constructor.")
+		public constructor(bitmapConfig: Bitmap.Config) : this(
+			quality = when (bitmapConfig) {
+				Bitmap.Config.RGB_565 -> BitmapQuality.MEMORY_SAVING
+				Bitmap.Config.RGBA_F16 -> BitmapQuality.HIGH
+				else -> BitmapQuality.STANDARD
+			},
+		)
+
+		override val bitmapConfig: Bitmap.Config
+			get() = quality.toBitmapConfig()
+
 		override fun make(): SkiaPooledImageRegionDecoder {
-			return SkiaPooledImageRegionDecoder(bitmapConfig)
+			return SkiaPooledImageRegionDecoder(quality)
 		}
 	}
 

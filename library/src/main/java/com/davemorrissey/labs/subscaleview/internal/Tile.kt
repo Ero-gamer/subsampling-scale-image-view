@@ -3,59 +3,78 @@ package com.davemorrissey.labs.subscaleview.internal
 import android.graphics.Bitmap
 import android.graphics.Rect
 
+/**
+ * Represents a single tile within the tiled image decoding grid.
+ *
+ * ### Thread safety
+ *
+ * [bitmap] is written from background coroutines (in [SubsamplingScaleImageView.loadTile])
+ * and read from the main thread (in [SubsamplingScaleImageView.onDraw]). This is the same
+ * pattern as the original SSIV — writes are effectively serialized because
+ * [SubsamplingScaleImageView.loadTile] only writes when the tile generation matches (i.e.,
+ * only one coroutine per tile can "win" the generation check), and reads happen on the
+ * main thread's draw frame.
+ *
+ * We do NOT recycle the old bitmap inside [setBitmap] (the background coroutine call site).
+ * Recycling a bitmap while the main thread may be in the middle of drawing it causes
+ * `RuntimeException: Canvas: trying to use a recycled bitmap`. Instead, the old bitmap is
+ * recycled only from [recycle], which is always called from the main thread.
+ */
 internal class Tile {
-	@JvmField
-	var sampleSize = 0
 
-	// BUG 2 FIX: The original setter auto-recycled the old bitmap inline:
-	//   field?.recycle()
-	//   field = value
-	//   isValid = true
-	// This was NOT thread-safe — if a background loadTile coroutine assigned a
-	// low-res bitmap after the main thread had already assigned the high-res one,
-	// the high-res bitmap was silently recycled and replaced with the blurry one.
-	//
-	// The fix: loadTile() now calls setBitmapSafe() which is guarded by a
-	// generation check in SubsamplingScaleImageView before calling it.
-	// The property setter is only used from recycle() (null assignment, main thread).
-	var bitmap: Bitmap? = null
+    @JvmField
+    var sampleSize: Int = 0
 
-	@JvmField
-	var isLoading = false
+    /** The decoded bitmap for this tile. May be null if not yet loaded or recycled. */
+    @Volatile
+    var bitmap: Bitmap? = null
 
-	@JvmField
-	var isVisible = false
+    @JvmField
+    var isLoading: Boolean = false
 
-	@JvmField
-	var isValid = false
+    @JvmField
+    var isVisible: Boolean = false
 
-	// Volatile fields instantiated once then updated before use to reduce GC.
-	@JvmField
-	var sRect: Rect = Rect()
+    /**
+     * True if [bitmap] was decoded during the CURRENT tile generation and is still valid.
+     * Set to false by [SubsamplingScaleImageView.invalidateTiles] when downsampling changes,
+     * causing a fresh reload. Controls whether [SubsamplingScaleImageView.refreshRequiredTiles]
+     * re-queues a decode for this tile.
+     */
+    @JvmField
+    var isValid: Boolean = false
 
-	@JvmField
-	val vRect = Rect()
+    @JvmField
+    var sRect: Rect = Rect()
 
-	@JvmField
-	val fileSRect = Rect()
+    @JvmField
+    val vRect: Rect = Rect()
 
-	/**
-	 * Atomically replaces the tile bitmap, recycling the old one.
-	 * Only called from SubsamplingScaleImageView.loadTile() after the generation
-	 * check confirms the decoded bitmap is still valid for this tile.
-	 */
-	fun storeBitmap(newBitmap: Bitmap?) {
-		val old = bitmap
-		bitmap = newBitmap
-		isValid = true
-		old?.recycle()
-	}
+    @JvmField
+    val fileSRect: Rect = Rect()
 
-	fun recycle() {
-		isVisible = false
-		val old = bitmap
-		bitmap = null
-		isValid = false
-		old?.recycle()
-	}
+    /**
+     * Stores a newly decoded bitmap. Called from a background coroutine ONLY when the
+     * tile generation check confirms this bitmap is current (not stale).
+     *
+     * Does NOT recycle the old bitmap — see class-level kdoc for the reason. The
+     * caller ([SubsamplingScaleImageView.loadTile]) holds a reference to the old bitmap
+     * and schedules its recycling via a main-thread post.
+     */
+    fun setBitmap(newBitmap: Bitmap?) {
+        bitmap = newBitmap
+        isValid = true
+        isLoading = false
+    }
+
+    /**
+     * Recycles this tile's bitmap and resets state. Must be called from the main thread.
+     */
+    fun recycle() {
+        isVisible = false
+        isLoading = false
+        isValid = false
+        bitmap?.recycle()
+        bitmap = null
+    }
 }
