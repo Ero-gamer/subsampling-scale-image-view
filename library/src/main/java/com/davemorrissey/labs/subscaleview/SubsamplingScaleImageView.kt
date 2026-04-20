@@ -479,13 +479,14 @@ public open class SubsamplingScaleImageView @JvmOverloads constructor(
 	}
 
 	@CheckResult
-	public fun snapshot(config: Bitmap.Config? = null): Bitmap? = bitmap?.let {
-		if (!it.isRecycled) {
-			it.copy(config ?: it.config, false)
-		} else {
-			null
-		}
-	}
+public fun snapshot(config: Bitmap.Config? = null): Bitmap? = bitmap?.let {
+    if (!it.isRecycled) {
+        val bitmapConfig: Bitmap.Config = config ?: it.config
+        it.copy(bitmapConfig, false)
+    } else {
+        null
+    }
+}
 
 	public fun setMinimumDpi(dpi: Int) {
 		val metrics = resources.displayMetrics
