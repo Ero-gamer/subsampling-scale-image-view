@@ -7,10 +7,10 @@ plugins {
 
 group = 'com.davemorrissey.labs'
 archivesBaseName = 'subsampling-scale-image-view-androidx'
-version = '4.2.8'
+version = '4.2.9'
 
 android {
-    compileSdk = 34
+    compileSdk = 36
     namespace = 'com.davemorrissey.labs.subscaleview'
     
     // This must be INSIDE the android block
@@ -20,7 +20,7 @@ android {
 	
     defaultConfig {
         minSdk = 23
-        targetSdk = 34
+        targetSdk = 36
         consumerProguardFiles 'proguard-rules.txt'
     }
 
@@ -64,7 +64,7 @@ afterEvaluate {
                 from components.release
                 groupId = 'com.github.Ero-gamer'
                 artifactId = 'subsampling-scale-image-view-androidx'
-                version = '4.2.8'
+                version = '4.2.9'
             }
         }
     }
