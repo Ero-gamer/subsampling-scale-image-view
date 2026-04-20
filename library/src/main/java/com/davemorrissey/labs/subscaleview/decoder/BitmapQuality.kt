@@ -22,15 +22,32 @@ import android.os.Build
  * banding in gradients and skin tones. Only use this on severely RAM-constrained devices
  * (< 512 MB) where OOM is a real risk.
  */
- 
 public enum class BitmapQuality {
 
+    /** ARGB_8888 — 32 bpp, full alpha, correct colors. Recommended default. */
     STANDARD,
 
+    /**
+     * RGBA_F16 — 64 bpp, 16-bit float per channel. Requires API 26+.
+     * Falls back to ARGB_8888 on older devices or unsupported configurations.
+     * Only useful for HDR/wide-gamut source images on matching displays.
+     */
+    HIGH,
+
+    /** RGB_565 — 16 bpp, no alpha, visible banding. Not recommended for manga. */
     MEMORY_SAVING;
 
+    /**
+     * Resolves this quality level to a concrete [Bitmap.Config] for the current device.
+     * [HIGH] falls back to ARGB_8888 on API < 26.
+     */
     internal fun toBitmapConfig(): Bitmap.Config = when (this) {
         STANDARD -> Bitmap.Config.ARGB_8888
+        HIGH -> if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
+            Bitmap.Config.RGBA_F16
+        } else {
+            Bitmap.Config.ARGB_8888
+        }
         MEMORY_SAVING -> Bitmap.Config.RGB_565
     }
 }
