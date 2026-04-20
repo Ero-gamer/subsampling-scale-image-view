@@ -22,46 +22,38 @@ import java.util.concurrent.locks.ReentrantReadWriteLock
 import java.util.zip.ZipFile
 
 /**
- * Default [ImageRegionDecoder] implementation using [BitmapRegionDecoder] (Skia).
+ * Default [ImageRegionDecoder] using [BitmapRegionDecoder] (Skia).
  *
- * ### Chroma alignment fix — green/blue bars on large images
+ * ### Chroma block alignment — green/blue tint fix (all formats, all Android versions)
  *
- * **The problem.** JPEG 4:2:0 and WEBP lossy encode color using 16×16 chroma minimum
- * coding units (MCUs). Android's [BitmapRegionDecoder] does NOT align requested tile
- * rects to these boundaries before decoding. When a tile top or left edge falls on a
- * non-multiple-of-16 row/column, the Cb and Cr chroma planes are read starting from
- * the wrong sample, producing the distinctive **green or blue horizontal bars** visible
- * across large images (typically 1400×10000+). This is a Skia/Android limitation present
- * on all API levels and affects JPEG, WEBP lossy, and any other 4:2:0 format.
+ * JPEG and WEBP lossy encode colour in 16×16 YCbCr minimum coding units (MCUs). When a
+ * tile boundary does not fall on a 16-pixel multiple, [BitmapRegionDecoder] reads chroma
+ * samples from the wrong MCU — producing green/blue horizontal bands on large strip images.
  *
- * **The fix.** Before calling [BitmapRegionDecoder.decodeRegion], expand all four edges
- * of the requested rectangle outward to the nearest 16-pixel boundary, clamped to the
- * image dimensions. After decoding the (slightly larger) aligned region, crop the
- * resulting bitmap back to the originally requested area. Maximum alignment expansion:
- * 15 pixels per edge — negligible compared to typical tile sizes of 256–512px.
+ * When [BitmapRegionDecoder.decodeRegion] is called with `inSampleSize > 1`, the decoder
+ * processes pixel groups of size `inSampleSize × inSampleSize`. The effective alignment
+ * requirement becomes `inSampleSize × 16`. This decoder uses
+ * `effectiveChromaBlockSize(inSampleSize)` to compute the correct alignment per decode call.
  *
- * If a tile rect is already aligned, no expansion or crop is performed (fast path).
+ * Fix: expand the tile rect to the effective block boundary, decode the aligned region,
+ * then crop the result back to the original pixels. Maximum overhead: ~15 × inSampleSize
+ * extra pixels per edge — negligible vs. tile sizes of 256–512 px.
  *
  * ### Color quality
  *
- * Default: [BitmapQuality.STANDARD] (ARGB_8888) — 32 bpp, correct colors, full alpha.
- * [BitmapQuality.HIGH] selects RGBA_F16 on API 26+ for wide-gamut HDR.
- * [BitmapQuality.MEMORY_SAVING] selects RGB_565 for constrained RAM.
+ * Defaults to [BitmapQuality.STANDARD] (ARGB_8888). Set [BitmapQuality.HIGH] for
+ * RGBA_F16 wide-gamut on API 26+, or [BitmapQuality.MEMORY_SAVING] for RGB_565.
  *
- * ### HARDWARE bitmap NOT used
+ * ### Why HARDWARE bitmap is not used
  *
- * Hardware bitmaps ([Bitmap.Config.HARDWARE]) are not used for tile decoding.
- * Hardware bitmaps cannot be drawn on a software [android.graphics.Canvas], which causes
- * a silent `IllegalStateException` that manifests as a solid black tile. Several render
- * paths in SSIV (downsampling transitions, zoom resets) and the surrounding app
- * (WebtoonScalingFrame's software layer during gestures) use software canvas contexts.
+ * Hardware bitmaps cannot be drawn on a software [android.graphics.Canvas]. Several
+ * render paths in the app (gesture layers, screenshot, shared elements) force software
+ * rendering, causing a silent `IllegalStateException` that results in solid black tiles.
  */
 public class SkiaImageRegionDecoder @JvmOverloads constructor(
     private val quality: BitmapQuality = BitmapQuality.STANDARD,
 ) : ImageRegionDecoder {
 
-    // ── Backwards-compat constructor (accepts Bitmap.Config directly) ──────────
-    @Suppress("DEPRECATION")
     @Deprecated("Use BitmapQuality constructor.")
     public constructor(bitmapConfig: Bitmap.Config) : this(
         quality = when (bitmapConfig) {
@@ -74,8 +66,10 @@ public class SkiaImageRegionDecoder @JvmOverloads constructor(
     private var decoder: BitmapRegionDecoder? = null
     private val decoderLock: ReadWriteLock = ReentrantReadWriteLock(true)
 
-    // Full image dimensions — required to clamp alignment expansion to image bounds.
+    /** Full image width — needed to clamp alignment expansion to the image boundary. */
     private var imageWidth: Int = 0
+
+    /** Full image height — needed to clamp alignment expansion to the image boundary. */
     private var imageHeight: Int = 0
 
     // ── init ──────────────────────────────────────────────────────────────────
@@ -145,27 +139,34 @@ public class SkiaImageRegionDecoder @JvmOverloads constructor(
             check(dec?.isRecycled == false) { "Cannot decode region — decoder recycled" }
             checkNotNull(dec) { "Decoder is null" }
 
+            val effectiveSampleSize = sampleSize.coerceAtLeast(1)
             val options = BitmapFactory.Options().apply {
-                inSampleSize = sampleSize.coerceAtLeast(1)
+                inSampleSize = effectiveSampleSize
                 inPreferredConfig = quality.toBitmapConfig()
-                // inMutable = false — tiles are read-only; no need to allocate mutable backing.
-                // This allows Skia to use more efficient internal memory layouts on some devices.
+                // inScaled = false: prevent Android from applying display density scaling
+                // to the decoded bitmap, which would alter pixel dimensions unexpectedly.
+                inScaled = false
             }
 
-            // Fast path: if the tile rect is already chroma-aligned, skip expand+crop.
-            if (sRect.isChromaAligned(imageWidth, imageHeight)) {
+            // Compute the effective chroma block size for this decode.
+            // For inSampleSize=1: block=16. For inSampleSize=2: block=32. Etc.
+            // Using the larger block ensures correct chroma alignment even when the
+            // decoder processes multiple MCUs per output sample.
+            val blockSize = effectiveChromaBlockSize(effectiveSampleSize)
+
+            // Fast path: all edges already on block boundaries → no overhead.
+            if (sRect.isChromaAligned(imageWidth, imageHeight, blockSize)) {
                 return dec.decodeRegion(sRect, options)
                     ?: error("BitmapRegionDecoder returned null for $sRect — " +
                         "image may be corrupted or unsupported on this device")
             }
 
-            // Slow path (the common case for large images): expand → decode → crop.
-            val aligned = sRect.alignToChromaBlocks(imageWidth, imageHeight)
+            // Slow path: expand → decode → crop to remove chroma corruption.
+            val aligned = sRect.alignToChromaBlocks(imageWidth, imageHeight, blockSize)
             val rawBitmap = dec.decodeRegion(aligned, options)
-                ?: error("BitmapRegionDecoder returned null for aligned region $aligned — " +
-                    "image may be corrupted or too large for this device's GPU")
+                ?: error("BitmapRegionDecoder returned null for aligned region $aligned")
 
-            cropToRequestedRegion(rawBitmap, sRect, aligned, options.inSampleSize)
+            cropToRequestedRegion(rawBitmap, sRect, aligned, effectiveSampleSize)
         } finally {
             decodeLock.unlock()
         }
