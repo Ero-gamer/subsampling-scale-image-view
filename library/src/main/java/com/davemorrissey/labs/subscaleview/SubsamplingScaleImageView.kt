@@ -1320,7 +1320,9 @@ public fun snapshot(config: Bitmap.Config? = null): Bitmap? = bitmap?.let {
 					// any concurrent onDraw() that reads tile.bitmap never sees a recycled
 					// bitmap. The @Volatile annotation on Tile.bitmap ensures visibility.
 					val oldBitmap = tile.bitmap
-					tile.setBitmap(decodedBitmap)
+					tile.bitmap = decodedBitmap
+                    tile.isValid = true
+                    tile.isLoading = false
 					onTileLoaded()
 					// Recycle the old bitmap on the main thread, after the new one is live.
 					oldBitmap?.recycle()
