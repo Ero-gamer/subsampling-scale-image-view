@@ -481,8 +481,7 @@ public open class SubsamplingScaleImageView @JvmOverloads constructor(
 	@CheckResult
 public fun snapshot(config: Bitmap.Config? = null): Bitmap? = bitmap?.let {
     if (!it.isRecycled) {
-        val bitmapConfig: Bitmap.Config = config ?: it.config
-        it.copy(bitmapConfig, false)
+        it.copy(config ?: it.config ?: Bitmap.Config.ARGB_8888, false)
     } else {
         null
     }
