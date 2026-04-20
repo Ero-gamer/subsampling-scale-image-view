@@ -15,7 +15,7 @@ import android.graphics.Rect
  * only one coroutine per tile can "win" the generation check), and reads happen on the
  * main thread's draw frame.
  *
- * We do NOT recycle the old bitmap inside [setBitmap] (the background coroutine call site).
+ * We do NOT recycle the old bitmap inside the bitmap property setter (the background coroutine call site).
  * Recycling a bitmap while the main thread may be in the middle of drawing it causes
  * `RuntimeException: Canvas: trying to use a recycled bitmap`. Instead, the old bitmap is
  * recycled only from [recycle], which is always called from the main thread.
@@ -52,20 +52,6 @@ internal class Tile {
 
     @JvmField
     val fileSRect: Rect = Rect()
-
-    /**
-     * Stores a newly decoded bitmap. Called from a background coroutine ONLY when the
-     * tile generation check confirms this bitmap is current (not stale).
-     *
-     * Does NOT recycle the old bitmap — see class-level kdoc for the reason. The
-     * caller ([SubsamplingScaleImageView.loadTile]) holds a reference to the old bitmap
-     * and schedules its recycling via a main-thread post.
-     */
-    fun setBitmap(newBitmap: Bitmap?) {
-        bitmap = newBitmap
-        isValid = true
-        isLoading = false
-    }
 
     /**
      * Recycles this tile's bitmap and resets state. Must be called from the main thread.
