@@ -163,76 +163,97 @@ internal fun detectImageFormat(context: Context, uri: Uri): String? = when (uri.
 
 // ─── Chroma block alignment ───────────────────────────────────────────────────
 //
-// PROBLEM — green/blue horizontal bars on large images (ALL formats, not just WEBP):
+// ROOT CAUSE of green/blue bars on large strip images (ALL formats, ALL Android versions):
 //
-// Android's BitmapRegionDecoder internally delegates to Skia, which decodes JPEG and
-// WEBP using their respective entropy-coded block structures:
+// JPEG and WEBP lossy encode colour using the YCbCr colour space with 4:2:0 chroma
+// subsampling. Luma (Y) is stored at full resolution, but chroma (Cb/Cr) is stored at
+// half resolution (one chroma sample per 2×2 luma pixel block). This creates indivisible
+// "minimum coding units" (MCUs):
 //
-//   • JPEG 4:2:0:  8×8 luma (Y) blocks, 16×16 chroma (Cb/Cr) minimum coding units (MCU)
-//   • JPEG 4:2:2:  8×8 luma (Y) blocks, 8×16 chroma MCUs
-//   • WEBP lossy:  16×16 YCbCr macroblocks (always 4:2:0)
-//   • PNG/WEBP-ll: lossless, no chroma subsampling → immune
+//   • JPEG 4:2:0  →  16×16 px MCU (2×2 grid of 8×8 DCT blocks, one shared chroma block)
+//   • JPEG 4:2:2  →  8×16 px MCU
+//   • WEBP lossy  →  16×16 px macroblock (same YCbCr 4:2:0 structure)
 //
-// When a tile boundary (top or left edge of the requested Rect) does not fall on a
-// 16-pixel boundary, BitmapRegionDecoder reads the Cb/Cr chroma planes starting from the
-// wrong row — because chroma samples are stored at half-resolution and the decoder's
-// integer arithmetic truncates instead of rounds. The misaligned chroma gives tiles a
-// strong green or blue tint that persists until the decoder is recycled and re-opened.
+// Android's BitmapRegionDecoder passes the requested Rect to Skia's JPEG/WEBP decoder,
+// which must decide which MCUs to decode. If a tile boundary (left or top edge of the
+// requested Rect) does NOT fall on an MCU boundary, the decoder reads chroma samples
+// that belong to the ADJACENT MCU — producing a horizontal or vertical band of shifted
+// colour (usually green, blue, or magenta tint).
 //
-// This affects EVERY ANDROID VERSION and every image format with 4:2:0 chroma.
-// Users of 1400×10000+ strip images see it on almost every tile boundary because most
-// strips have heights that are not multiples of 16.
+// This is a Skia/Android platform bug present on EVERY Android version. It is especially
+// visible on tall strip images (1400×10000+) where many tile boundaries exist, but will
+// also appear on any image whose tile layout lands on a non-MCU-aligned row.
 //
-// FIX: Align all four edges of the tile rect outward to multiples of CHROMA_BLOCK_SIZE
-// before calling decodeRegion(). After decoding the slightly larger region, crop it back
-// to the originally requested area. Maximum alignment padding: 15 pixels per edge,
-// which is negligible compared to tile sizes of 256–512px.
+// ADDITIONAL COMPLICATION — inSampleSize > 1:
+// When BitmapRegionDecoder decodes with inSampleSize=N, Android's decoder processes
+// MCUs in groups of N×N. The effective alignment unit becomes N × MCU_SIZE. Using only
+// the base MCU_SIZE (16) as the alignment when inSampleSize > 1 may leave a residual
+// chroma shift because the decoder's internal subsampling arithmetic still rounds to
+// the larger effective block boundary.
 //
-// 16 is the correct alignment for both JPEG 4:2:0 and WEBP lossy. JPEG 4:2:2 MCUs are
-// 8×16 but aligning to 16 in both dimensions covers that case as well.
+// THE FIX: Before calling decodeRegion(), expand all four edges of the requested Rect
+// OUTWARD to the nearest effective-block boundary (CHROMA_BLOCK_SIZE × inSampleSize),
+// clamped to the image dimensions. After decoding the slightly larger region, crop the
+// bitmap back to the originally requested pixel area. Maximum expansion per edge:
+// (CHROMA_BLOCK_SIZE × inSampleSize) − 1 pixels — negligible vs. typical tile sizes.
+//
+// If all four edges are already aligned, the fast path skips expand+crop entirely (zero
+// overhead for aligned tiles, which is common for image widths that are multiples of 16).
 
+/** Base chroma MCU size for JPEG 4:2:0 and WEBP lossy (16×16 px). */
 internal const val CHROMA_BLOCK_SIZE = 16
 
 /**
- * Returns a copy of this [Rect] with all four edges expanded outward to the nearest
- * [CHROMA_BLOCK_SIZE] boundary, clamped to [imageWidth] × [imageHeight].
+ * Computes the effective alignment block size for a given [inSampleSize].
  *
- * If no expansion is needed (all edges already aligned), the same rect values are
- * returned in a new [Rect] instance.
+ * When decoding with [inSampleSize] > 1, BitmapRegionDecoder processes
+ * [inSampleSize]×[inSampleSize] groups of pixels per MCU. The required alignment is
+ * therefore [CHROMA_BLOCK_SIZE] × [inSampleSize], rounded up to the next power of 2
+ * (since inSampleSize itself is always a power of 2 in SSIV).
  */
-internal fun Rect.alignToChromaBlocks(imageWidth: Int, imageHeight: Int): Rect {
-    val alignedLeft = (left / CHROMA_BLOCK_SIZE) * CHROMA_BLOCK_SIZE
-    val alignedTop = (top / CHROMA_BLOCK_SIZE) * CHROMA_BLOCK_SIZE
-    val alignedRight = minOf(
-        ((right + CHROMA_BLOCK_SIZE - 1) / CHROMA_BLOCK_SIZE) * CHROMA_BLOCK_SIZE,
-        imageWidth,
-    )
-    val alignedBottom = minOf(
-        ((bottom + CHROMA_BLOCK_SIZE - 1) / CHROMA_BLOCK_SIZE) * CHROMA_BLOCK_SIZE,
-        imageHeight,
-    )
+internal fun effectiveChromaBlockSize(inSampleSize: Int): Int {
+    val s = inSampleSize.coerceAtLeast(1)
+    return CHROMA_BLOCK_SIZE * s
+}
+
+/**
+ * Returns true if this [Rect] is already aligned to [effectiveChromaBlockSize] on all
+ * four edges (or the right/bottom edge exactly equals the image boundary). When true,
+ * the caller can call [BitmapRegionDecoder.decodeRegion] directly with no alignment
+ * expansion or post-decode crop — zero extra work.
+ */
+internal fun Rect.isChromaAligned(imageWidth: Int, imageHeight: Int, blockSize: Int): Boolean {
+    val bs = blockSize.coerceAtLeast(1)
+    return (left % bs == 0) &&
+        (top % bs == 0) &&
+        (right == imageWidth || right % bs == 0) &&
+        (bottom == imageHeight || bottom % bs == 0)
+}
+
+/**
+ * Returns a copy of this [Rect] with all four edges expanded OUTWARD to the nearest
+ * [blockSize] boundary, clamped to [imageWidth] × [imageHeight].
+ *
+ * If no expansion is needed (all edges already aligned), the returned [Rect] has the
+ * same coordinates as the receiver.
+ */
+internal fun Rect.alignToChromaBlocks(imageWidth: Int, imageHeight: Int, blockSize: Int): Rect {
+    val bs = blockSize.coerceAtLeast(1)
+    val alignedLeft = (left / bs) * bs
+    val alignedTop = (top / bs) * bs
+    val alignedRight = minOf(((right + bs - 1) / bs) * bs, imageWidth)
+    val alignedBottom = minOf(((bottom + bs - 1) / bs) * bs, imageHeight)
     return Rect(alignedLeft, alignedTop, alignedRight, alignedBottom)
 }
 
 /**
- * Returns true if this [Rect] is already aligned to [CHROMA_BLOCK_SIZE] on all four
- * edges (or the right/bottom edge is at the image boundary). In this case no alignment
- * expansion or post-decode crop is needed and we can call decodeRegion() directly.
- */
-internal fun Rect.isChromaAligned(imageWidth: Int, imageHeight: Int): Boolean =
-    (left % CHROMA_BLOCK_SIZE == 0) &&
-        (top % CHROMA_BLOCK_SIZE == 0) &&
-        (right == imageWidth || right % CHROMA_BLOCK_SIZE == 0) &&
-        (bottom == imageHeight || bottom % CHROMA_BLOCK_SIZE == 0)
-
-/**
- * After decoding an aligned region [aligned] in place of the originally requested
- * [requested], crops the resulting [rawBitmap] back to exactly the requested pixels.
+ * After decoding an aligned region [aligned] instead of the originally requested [requested],
+ * crops [rawBitmap] back to the pixels that correspond to [requested].
  *
- * [inSampleSize] is the downsampling factor used during decode — coordinate offsets
+ * [inSampleSize] is the downsampling factor used during the decode — coordinate offsets
  * must be divided by it to convert from source-image pixels to decoded-bitmap pixels.
  *
- * Returns [rawBitmap] unchanged if no cropping is needed (no alignment padding was added).
+ * Returns [rawBitmap] unchanged (no new allocation) if no padding was added on any edge.
  * If a new bitmap is created, [rawBitmap] is recycled before returning.
  */
 internal fun cropToRequestedRegion(
@@ -247,15 +268,15 @@ internal fun cropToRequestedRegion(
     val cropLeft = (requested.left - aligned.left) / sample
     val cropTop = (requested.top - aligned.top) / sample
 
-    // Expected output size (round up to handle integer division in inSampleSize).
+    // Expected output dimensions, rounding up to handle integer division in inSampleSize.
     val cropWidth = (requested.width() + sample - 1) / sample
     val cropHeight = (requested.height() + sample - 1) / sample
 
-    // Clamp to actual decoded size (may be slightly smaller at image edges).
+    // Clamp to actual decoded bitmap size (may be 1–2 px smaller at the image boundary).
     val safeWidth = cropWidth.coerceAtMost(rawBitmap.width - cropLeft).coerceAtLeast(1)
     val safeHeight = cropHeight.coerceAtMost(rawBitmap.height - cropTop).coerceAtLeast(1)
 
-    // If the decoded bitmap exactly matches the requested area, return it unchanged.
+    // Fast path: decoded bitmap exactly matches the requested area.
     if (cropLeft == 0 && cropTop == 0 &&
         safeWidth == rawBitmap.width && safeHeight == rawBitmap.height
     ) {
@@ -267,8 +288,9 @@ internal fun cropToRequestedRegion(
         rawBitmap.recycle()
         cropped
     } catch (_: Exception) {
-        // Safety net: if crop fails for any reason, return the raw bitmap as-is.
-        // The slight color fringe is preferable to a crash.
+        // Safety net: if crop fails (edge case — invalid bounds at image boundary),
+        // return the slightly larger raw bitmap rather than crashing. The 1–2 extra
+        // border pixels are preferable to a crash.
         rawBitmap
     }
 }
