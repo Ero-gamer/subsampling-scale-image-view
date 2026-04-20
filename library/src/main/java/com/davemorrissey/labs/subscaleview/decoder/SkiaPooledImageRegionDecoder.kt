@@ -235,14 +235,18 @@ public open class SkiaPooledImageRegionDecoder @JvmOverloads constructor(
 						}
 
 						// Apply chroma block alignment to fix green/blue bars on large images.
-						// See SkiaImageRegionDecoder for full explanation.
+						// Use effectiveChromaBlockSize(inSampleSize) so the alignment accounts
+						// for the decoder's per-sample-size MCU grouping — same as in
+						// SkiaImageRegionDecoder. This is the critical fix for remaining tints
+						// when tiles are decoded at sampleSize > 1.
 						val iw = imageDimensions.x
 						val ih = imageDimensions.y
-						if (sRect.isChromaAligned(iw, ih)) {
+						val blockSize = effectiveChromaBlockSize(options.inSampleSize)
+						if (sRect.isChromaAligned(iw, ih, blockSize)) {
 							return decoder.decodeRegion(sRect, options)
 								?: throw ImageDecodeException.create(context, uri)
 						}
-						val aligned = sRect.alignToChromaBlocks(iw, ih)
+						val aligned = sRect.alignToChromaBlocks(iw, ih, blockSize)
 						val rawBitmap = decoder.decodeRegion(aligned, options)
 							?: throw ImageDecodeException.create(context, uri)
 						return cropToRequestedRegion(rawBitmap, sRect, aligned, options.inSampleSize)
