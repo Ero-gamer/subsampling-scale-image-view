@@ -479,13 +479,18 @@ public open class SubsamplingScaleImageView @JvmOverloads constructor(
 	}
 
 	@CheckResult
-public fun snapshot(config: Bitmap.Config? = null): Bitmap? = bitmap?.let {
-    if (!it.isRecycled) {
-        it.copy(config ?: it.config ?: Bitmap.Config.ARGB_8888, false)
-    } else {
-        null
-    }
-}
+	public fun snapshot(config: Bitmap.Config? = null): Bitmap? = bitmap?.let {
+		if (!it.isRecycled) {
+			// Triple-Elvis: the parameter config (nullable), then the bitmap's own config
+			// (also nullable on some devices), then a guaranteed non-null ARGB_8888 fallback.
+			// This avoids the Kotlin compilation error "Bitmap.Config? vs Bitmap.Config"
+			// when passing directly to Bitmap.copy() which requires a non-null Config.
+			val resolvedConfig: Bitmap.Config = config ?: it.config ?: Bitmap.Config.ARGB_8888
+			it.copy(resolvedConfig, false)
+		} else {
+			null
+		}
+	}
 
 	public fun setMinimumDpi(dpi: Int) {
 		val metrics = resources.displayMetrics
@@ -1316,15 +1321,16 @@ public fun snapshot(config: Bitmap.Config? = null): Bitmap? = bitmap?.let {
 				// Back on the main thread: check whether the generation is still current.
 				if (tileGeneration.get() == capturedGeneration) {
 					// Generation matches — store the bitmap and trigger a redraw.
-					// Capture and recycle the old bitmap AFTER setting the new one, so
-					// any concurrent onDraw() that reads tile.bitmap never sees a recycled
-					// bitmap. The @Volatile annotation on Tile.bitmap ensures visibility.
+					// Capture the old bitmap BEFORE overwriting, then recycle it AFTER
+					// onTileLoaded() so the main thread's current draw frame can finish
+					// safely. tile.bitmap is @Volatile so the assignment is immediately
+					// visible to the main thread.
 					val oldBitmap = tile.bitmap
-					tile.bitmap = decodedBitmap
-                    tile.isValid = true
-                    tile.isLoading = false
+					tile.bitmap = decodedBitmap   // visible to onDraw via @Volatile
+					tile.isValid = true
+					tile.isLoading = false
 					onTileLoaded()
-					// Recycle the old bitmap on the main thread, after the new one is live.
+					// Recycle old bitmap after the new one is live on the main thread.
 					oldBitmap?.recycle()
 				} else {
 					// Generation changed while we were decoding: the bitmap is stale
