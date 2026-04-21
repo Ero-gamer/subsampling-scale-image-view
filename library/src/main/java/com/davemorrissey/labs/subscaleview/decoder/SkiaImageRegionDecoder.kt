@@ -41,8 +41,8 @@ import java.util.zip.ZipFile
  *
  * ### Color quality
  *
- * Defaults to [BitmapQuality.STANDARD] (ARGB_8888). Set [BitmapQuality.HIGH] for
- * RGBA_F16 wide-gamut on API 26+, or [BitmapQuality.MEMORY_SAVING] for RGB_565.
+ * Defaults to [BitmapQuality.STANDARD] (ARGB_8888). RGBA_F16 (HIGH) has been removed.
+ * Use [BitmapQuality.MEMORY_SAVING] (RGB_565) only on low-RAM devices.
  *
  * ### Why HARDWARE bitmap is not used
  *
@@ -58,7 +58,9 @@ public class SkiaImageRegionDecoder @JvmOverloads constructor(
     public constructor(bitmapConfig: Bitmap.Config) : this(
         quality = when (bitmapConfig) {
             Bitmap.Config.RGB_565 -> BitmapQuality.MEMORY_SAVING
-            Bitmap.Config.RGBA_F16 -> BitmapQuality.HIGH
+            // RGBA_F16 (HIGH) removed; fall back to STANDARD (ARGB_8888).
+            else -> BitmapQuality.STANDARD
+            // unreachable but needed to suppress warning:
             else -> BitmapQuality.STANDARD
         },
     )
@@ -201,7 +203,9 @@ public class SkiaImageRegionDecoder @JvmOverloads constructor(
         public constructor(bitmapConfig: Bitmap.Config) : this(
             quality = when (bitmapConfig) {
                 Bitmap.Config.RGB_565 -> BitmapQuality.MEMORY_SAVING
-                Bitmap.Config.RGBA_F16 -> BitmapQuality.HIGH
+                // RGBA_F16 (HIGH) removed; fall back to STANDARD (ARGB_8888).
+            else -> BitmapQuality.STANDARD
+            // unreachable but needed to suppress warning:
                 else -> BitmapQuality.STANDARD
             },
         )
