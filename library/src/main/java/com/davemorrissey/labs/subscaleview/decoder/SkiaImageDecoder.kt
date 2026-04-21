@@ -43,8 +43,9 @@ import java.util.zip.ZipFile
  *
  * ### Color quality
  *
- * Default: [BitmapQuality.STANDARD] (ARGB_8888). Supports [BitmapQuality.HIGH]
- * (RGBA_F16, API 26+) and [BitmapQuality.MEMORY_SAVING] (RGB_565) via the factory.
+ * Default: [BitmapQuality.STANDARD] (ARGB_8888). Supports [BitmapQuality.MEMORY_SAVING]
+ * (RGB_565) via the factory for low-RAM devices. RGBA_F16 ("HIGH") has been removed —
+ * it provided no benefit on standard sRGB displays and doubled memory per tile.
  */
 public class SkiaImageDecoder @JvmOverloads constructor(
     private val quality: BitmapQuality = BitmapQuality.STANDARD,
@@ -55,7 +56,7 @@ public class SkiaImageDecoder @JvmOverloads constructor(
     public constructor(bitmapConfig: Bitmap.Config) : this(
         quality = when (bitmapConfig) {
             Bitmap.Config.RGB_565 -> BitmapQuality.MEMORY_SAVING
-            Bitmap.Config.RGBA_F16 -> BitmapQuality.HIGH
+            // RGBA_F16 (HIGH) is removed; fall back to STANDARD (ARGB_8888).
             else -> BitmapQuality.STANDARD
         },
     )
@@ -107,7 +108,7 @@ public class SkiaImageDecoder @JvmOverloads constructor(
         public constructor(bitmapConfig: Bitmap.Config) : this(
             quality = when (bitmapConfig) {
                 Bitmap.Config.RGB_565 -> BitmapQuality.MEMORY_SAVING
-                Bitmap.Config.RGBA_F16 -> BitmapQuality.HIGH
+                // RGBA_F16 (HIGH) is removed; fall back to STANDARD (ARGB_8888).
                 else -> BitmapQuality.STANDARD
             },
         )
