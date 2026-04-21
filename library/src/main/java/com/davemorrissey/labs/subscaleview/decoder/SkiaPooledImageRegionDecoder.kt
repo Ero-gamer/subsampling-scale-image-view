@@ -51,7 +51,9 @@ public open class SkiaPooledImageRegionDecoder @JvmOverloads constructor(
 	public constructor(bitmapConfig: Bitmap.Config) : this(
 		quality = when (bitmapConfig) {
 			Bitmap.Config.RGB_565 -> BitmapQuality.MEMORY_SAVING
-			Bitmap.Config.RGBA_F16 -> BitmapQuality.HIGH
+			// RGBA_F16 (HIGH) removed; fall back to STANDARD.
+		else -> BitmapQuality.STANDARD
+		//@suppress:
 			else -> BitmapQuality.STANDARD
 		},
 	)
@@ -333,7 +335,9 @@ public open class SkiaPooledImageRegionDecoder @JvmOverloads constructor(
 		public constructor(bitmapConfig: Bitmap.Config) : this(
 			quality = when (bitmapConfig) {
 				Bitmap.Config.RGB_565 -> BitmapQuality.MEMORY_SAVING
-				Bitmap.Config.RGBA_F16 -> BitmapQuality.HIGH
+				// RGBA_F16 (HIGH) removed; fall back to STANDARD.
+		else -> BitmapQuality.STANDARD
+		//@suppress:
 				else -> BitmapQuality.STANDARD
 			},
 		)
