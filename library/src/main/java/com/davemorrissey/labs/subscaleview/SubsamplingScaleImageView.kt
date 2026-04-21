@@ -68,6 +68,8 @@ import kotlinx.coroutines.runInterruptible
 import java.util.Locale
 import java.util.concurrent.atomic.AtomicInteger
 import java.util.concurrent.locks.ReentrantReadWriteLock
+import kotlin.math.ceil
+import kotlin.math.floor
 import kotlin.math.min
 import kotlin.math.roundToInt
 
@@ -273,8 +275,10 @@ public open class SubsamplingScaleImageView @JvmOverloads constructor(
 	private val decoderLock = ReentrantReadWriteLock(true)
 	// Decoder factories. Both default to BitmapQuality.STANDARD (ARGB_8888), which is
 	// the correct color depth for manga/webtoon — 8 bits per channel, full alpha, no
-	// visible banding. Override to use BitmapQuality.HIGH (RGBA_F16, API 26+) for HDR
-	// content or BitmapQuality.MEMORY_SAVING (RGB_565) for severely RAM-limited devices.
+	// visible banding. Override to BitmapQuality.MEMORY_SAVING (RGB_565) only for
+	// severely RAM-limited devices where OOM risk outweighs color quality.
+	// RGBA_F16 ("HIGH") has been removed — it doubled memory per tile with no visible
+	// benefit on standard sRGB displays.
 	public var bitmapDecoderFactory: DecoderFactory<out ImageDecoder> = SkiaImageDecoder.Factory()
 	public var regionDecoderFactory: DecoderFactory<out ImageRegionDecoder> = SkiaImageRegionDecoder.Factory()
 
@@ -373,8 +377,13 @@ public open class SubsamplingScaleImageView @JvmOverloads constructor(
 	)
 
 	init {
-		setMinimumDpi(160)
-		setDoubleTapZoomDpi(160)
+		// ZOOM LEVEL FIX: lowering dpi values doubles the effective max/double-tap zoom.
+		// setMinimumDpi(N) computes maxScale = screenDPI/N. At 160dpi target on a 320dpi
+		// screen you get maxScale=2. At 80dpi you get maxScale=4, giving full 1:1 reading
+		// zoom on typical phone screens. On lower-DPI devices like Android TV (96dpi) the
+		// old value of 160 meant maxScale<1 — impossible to zoom IN at all.
+		setMinimumDpi(80)
+		setDoubleTapZoomDpi(80)
 		setMinimumTileDpi(320)
 		setGestureDetector(context)
 		val ta = context.obtainStyledAttributes(attrs, R.styleable.SubsamplingScaleImageView, defStyleAttr, 0)
@@ -977,12 +986,24 @@ public open class SubsamplingScaleImageView @JvmOverloads constructor(
 	}
 
 	private fun sourceToViewRect(sRect: Rect, vTarget: Rect) {
-		vTarget[
-			sourceToViewX(sRect.left.toFloat()).toInt(), sourceToViewY(sRect.top.toFloat()).toInt(),
-			sourceToViewX(
-				sRect.right.toFloat(),
-			).toInt(),
-		] = sourceToViewY(sRect.bottom.toFloat()).toInt()
+		// TILE SEAM FIX: use floor() for left/top, ceil() for right/bottom.
+		//
+		// Previously all four edges used .toInt() which is floor(). When two adjacent
+		// tiles share a boundary that maps to e.g. 511.9, both edges round DOWN to 511
+		// and the 1-pixel gap between them exposes the coarser base-layer tile beneath —
+		// causing a 1-px dark or tinted bar at every tile junction on tall strip images.
+		//
+		// Correct approach: the left/top edge of a tile should never start AFTER its
+		// source position (floor), and the right/bottom edge should never end BEFORE its
+		// source position (ceil). This guarantees pixel-perfect coverage with no gaps
+		// and at most 1-pixel overlap between adjacent tiles (which is harmless; the
+		// overlapping pixel is drawn twice with identical content).
+		vTarget.set(
+			floor(sourceToViewX(sRect.left.toFloat())).toInt(),
+			floor(sourceToViewY(sRect.top.toFloat())).toInt(),
+			ceil(sourceToViewX(sRect.right.toFloat())).toInt(),
+			ceil(sourceToViewY(sRect.bottom.toFloat())).toInt(),
+		)
 	}
 
 	private fun viewToSourceX(vx: Float): Float {
