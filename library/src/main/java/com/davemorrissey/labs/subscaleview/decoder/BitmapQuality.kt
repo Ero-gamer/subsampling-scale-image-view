@@ -1,7 +1,6 @@
 package com.davemorrissey.labs.subscaleview.decoder
 
 import android.graphics.Bitmap
-import android.os.Build
 
 /**
  * Controls the color depth used when decoding bitmap tiles and full images.
@@ -9,45 +8,34 @@ import android.os.Build
  * | Level          | Config      | Bits/px | Notes                                          |
  * |----------------|-------------|---------|------------------------------------------------|
  * | [STANDARD]     | ARGB_8888   | 32      | **Default.** Full alpha, correct manga colors. |
- * | [HIGH]         | RGBA_F16    | 64      | Wide-gamut HDR. API 26+ only. High memory.     |
- * | [MEMORY_SAVING]| RGB_565     | 16      | No alpha, visible color banding. Avoid.        |
+ * | [MEMORY_SAVING]| RGB_565     | 16      | No alpha, visible color banding. Avoid unless  |
+ * |                |             |         | device RAM is critically low.                  |
  *
  * **[STANDARD]** (ARGB_8888) is the correct choice for all manga and webtoon content.
- *
- * **[HIGH]** (RGBA_F16) doubles memory consumption per tile and is only visually
- * distinguishable on displays with P3 or Rec.2020 color gamut. Standard sRGB manga
- * shows no benefit. Falls back to ARGB_8888 below API 26.
+ * It provides full 8-bit precision per channel, correct alpha, and no visible banding.
+ * This is used by default on all normal devices.
  *
  * **[MEMORY_SAVING]** (RGB_565) strips the alpha channel and produces visible color
  * banding in gradients and skin tones. Only use this on severely RAM-constrained devices
- * (< 512 MB) where OOM is a real risk.
+ * (typically detected automatically via [android.app.ActivityManager.isLowRamDevice]).
+ *
+ * Note: RGBA_F16 (previously "HIGH") has been removed. It doubles memory consumption
+ * per tile and provides no visible benefit on standard sRGB manga/webtoon content.
+ * ARGB_8888 is the correct and sufficient format for all supported content.
  */
 public enum class BitmapQuality {
 
-    /** ARGB_8888 — 32 bpp, full alpha, correct colors. Recommended default. */
+    /** ARGB_8888 — 32 bpp, full alpha, correct colors. The recommended default. */
     STANDARD,
 
-    /**
-     * RGBA_F16 — 64 bpp, 16-bit float per channel. Requires API 26+.
-     * Falls back to ARGB_8888 on older devices or unsupported configurations.
-     * Only useful for HDR/wide-gamut source images on matching displays.
-     */
-    HIGH,
-
-    /** RGB_565 — 16 bpp, no alpha, visible banding. Not recommended for manga. */
+    /** RGB_565 — 16 bpp, no alpha, visible banding. Use only on low-RAM devices. */
     MEMORY_SAVING;
 
     /**
      * Resolves this quality level to a concrete [Bitmap.Config] for the current device.
-     * [HIGH] falls back to ARGB_8888 on API < 26.
      */
     internal fun toBitmapConfig(): Bitmap.Config = when (this) {
         STANDARD -> Bitmap.Config.ARGB_8888
-        HIGH -> if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
-            Bitmap.Config.RGBA_F16
-        } else {
-            Bitmap.Config.ARGB_8888
-        }
         MEMORY_SAVING -> Bitmap.Config.RGB_565
     }
 }
