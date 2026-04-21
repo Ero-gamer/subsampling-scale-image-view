@@ -335,8 +335,6 @@ public open class SkiaPooledImageRegionDecoder @JvmOverloads constructor(
 				Bitmap.Config.RGB_565 -> BitmapQuality.MEMORY_SAVING
 				// RGBA_F16 (HIGH) removed; fall back to STANDARD.
 		else -> BitmapQuality.STANDARD
-		//@suppress:
-				else -> BitmapQuality.STANDARD
 			},
 		)
 
