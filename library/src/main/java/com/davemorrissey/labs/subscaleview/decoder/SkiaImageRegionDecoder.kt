@@ -60,8 +60,6 @@ public class SkiaImageRegionDecoder @JvmOverloads constructor(
             Bitmap.Config.RGB_565 -> BitmapQuality.MEMORY_SAVING
             // RGBA_F16 (HIGH) removed; fall back to STANDARD (ARGB_8888).
             else -> BitmapQuality.STANDARD
-            // unreachable but needed to suppress warning:
-            else -> BitmapQuality.STANDARD
         },
     )
 
