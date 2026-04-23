@@ -39,7 +39,7 @@ Subsampling Scale Image View Library (Enhanced Version based on Kotatsu SSIV For
 
     ```groovy
     dependencies {
-        implementation("com.github.Ero-gamer:subsampling-scale-image-view:$version")
+        implementation("com.github.Ero-gamer:subsampling-scale-image-view:$4.3.9")
     }
     ```
 
