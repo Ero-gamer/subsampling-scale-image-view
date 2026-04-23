@@ -7,7 +7,7 @@ Subsampling Scale Image View Library (Enhanced Version based on Kotatsu SSIV For
 
 # Differences from Kotatsu SSIV:
 
-- Fixed and upgraded default image quality decoder to use ARGB_8888 (highest quality)
+- Fixed and upgraded default image decoder to use ARGB_8888. (High Quality)
 - Fixed visual bugs & optimizated performance.
 - Updated dependencies & QOL improvements.
 
