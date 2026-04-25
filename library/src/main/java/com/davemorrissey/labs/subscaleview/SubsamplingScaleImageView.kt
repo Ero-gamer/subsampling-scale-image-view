@@ -702,7 +702,14 @@ public open class SubsamplingScaleImageView @JvmOverloads constructor(
 								)
 							}
 							matrix2!!.setPolyToPoly(srcArray, 0, dstArray, 0, 4)
+							// Clip to tile rect before drawing. Without this, Android HWUI bilinear
+							// filter with a complex matrix can sample outside bitmap edges (DECAL
+							// instead of CLAMP), creating coloured semi-transparent fringes at every
+							// tile seam on tall images. Hardware scissor has zero extra cost.
+							canvas.save()
+							canvas.clipRect(tile.vRect)
 							canvas.drawBitmap(tileBitmap, matrix2!!, bitmapPaint)
+							canvas.restore()
 							if (isDebugDrawingEnabled) {
 								canvas.drawRect(tile.vRect, debugLinePaint!!)
 							}
@@ -1768,7 +1775,8 @@ public open class SubsamplingScaleImageView @JvmOverloads constructor(
 				// Note: using Paint(flags) constructor form has a documented quirk on some
 				// API levels where flags are not fully propagated; explicit assignment is safer.
 				isFilterBitmap = true
-				isDither = true
+				// isDither intentionally omitted: dithering is a no-op for ARGB_8888 rendering
+				// and on some GPU drivers it interferes with bilinear filtering at tile seams.
 				isAntiAlias = true // No effect on drawBitmap, but kept for subclass paint reuse.
 				if (colorFilter != null) {
 					this.colorFilter = colorFilter
