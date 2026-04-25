@@ -232,6 +232,9 @@ public open class SkiaPooledImageRegionDecoder @JvmOverloads constructor(
 						val options = BitmapFactory.Options().apply {
 							inSampleSize = sampleSize.coerceAtLeast(1)
 							inPreferredConfig = quality.toBitmapConfig()
+							// inScaled = false: prevent Android density scaling from altering tile
+							// bitmap dimensions, which breaks chroma-alignment crop offsets.
+							inScaled = false
 						}
 
 						// Apply chroma block alignment to fix green/blue bars on large images.
