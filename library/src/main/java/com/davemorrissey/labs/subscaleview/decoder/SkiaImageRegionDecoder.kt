@@ -188,8 +188,13 @@ public class SkiaImageRegionDecoder @JvmOverloads constructor(
         }
     }
 
+    // BitmapRegionDecoder is NOT thread-safe. The readLock() would allow concurrent
+    // decodeRegion() calls from multiple coroutines (Dispatchers.Default thread pool),
+    // which corrupts the decoder's internal state and produces garbled/tinted tiles.
+    // Using writeLock() ensures mutual exclusion: only one decodeRegion() runs at a time,
+    // while still blocking recycle() from running concurrently with any active decode.
     private val decodeLock: Lock
-        get() = decoderLock.readLock()
+        get() = decoderLock.writeLock()
 
     // ── Factory ───────────────────────────────────────────────────────────────
 
