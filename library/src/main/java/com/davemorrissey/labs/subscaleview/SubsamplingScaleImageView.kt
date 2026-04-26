@@ -653,17 +653,18 @@ public open class SubsamplingScaleImageView @JvmOverloads constructor(
 								tileBitmap.height.toFloat(),
 							)
 							if (getRequiredRotation() == ORIENTATION_0) {
-								setMatrixArray(
-									dstArray,
-									tile.vRect.left.toFloat(),
-									tile.vRect.top.toFloat(),
-									tile.vRect.right.toFloat(),
-									tile.vRect.top.toFloat(),
-									tile.vRect.right.toFloat(),
-									tile.vRect.bottom.toFloat(),
-									tile.vRect.left.toFloat(),
-									tile.vRect.bottom.toFloat(),
-								)
+								// AFFINE FIX: for no-rotation, use setScale+postTranslate instead of
+								// setPolyToPoly. setPolyToPoly solves a perspective matrix — even for
+								// a pure axis-aligned rect it introduces tiny non-zero perspective
+								// coefficients (h[6], h[7] ≠ 0) due to floating-point arithmetic.
+								// HWUI activates perspective-correct texture sampling for any matrix
+								// with non-zero perspective row, producing coloured semi-transparent
+								// fringes at every tile seam on tall images. setScale/postTranslate
+								// guarantees h[6]=h[7]=0 exactly → pure affine shader, no fringing.
+								val scaleX = (tile.vRect.right - tile.vRect.left).toFloat() / tileBitmap.width
+								val scaleY = (tile.vRect.bottom - tile.vRect.top).toFloat() / tileBitmap.height
+								matrix2!!.setScale(scaleX, scaleY)
+								matrix2!!.postTranslate(tile.vRect.left.toFloat(), tile.vRect.top.toFloat())
 							} else if (getRequiredRotation() == ORIENTATION_90) {
 								setMatrixArray(
 									dstArray,
@@ -701,7 +702,11 @@ public open class SubsamplingScaleImageView @JvmOverloads constructor(
 									tile.vRect.bottom.toFloat(),
 								)
 							}
-							matrix2!!.setPolyToPoly(srcArray, 0, dstArray, 0, 4)
+							// setPolyToPoly only for rotated orientations — ORIENTATION_0 sets
+							// matrix2 directly above using setScale+postTranslate (affine, no fringe).
+							if (getRequiredRotation() != ORIENTATION_0) {
+								matrix2!!.setPolyToPoly(srcArray, 0, dstArray, 0, 4)
+							}
 							// Clip to tile rect before drawing. Without this, Android HWUI bilinear
 							// filter with a complex matrix can sample outside bitmap edges (DECAL
 							// instead of CLAMP), creating coloured semi-transparent fringes at every
@@ -1775,8 +1780,11 @@ public open class SubsamplingScaleImageView @JvmOverloads constructor(
 				// Note: using Paint(flags) constructor form has a documented quirk on some
 				// API levels where flags are not fully propagated; explicit assignment is safer.
 				isFilterBitmap = true
-				// isDither intentionally omitted: dithering is a no-op for ARGB_8888 rendering
-				// and on some GPU drivers it interferes with bilinear filtering at tile seams.
+				// isDither: Android's ordered (Bayer 4×4) dithering. In HWUI (hardware
+				// rendering) this flag is ignored on API 26+. In software rendering it reduces
+				// colour banding when the tile bitmap is RGB_565 or the target surface is lower
+				// than 8-bit per channel. Keeping it true covers the software fallback path.
+				isDither = true
 				isAntiAlias = true // No effect on drawBitmap, but kept for subclass paint reuse.
 				if (colorFilter != null) {
 					this.colorFilter = colorFilter
