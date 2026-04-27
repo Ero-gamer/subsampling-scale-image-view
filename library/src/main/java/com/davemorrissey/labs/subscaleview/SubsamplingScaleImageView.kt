@@ -702,14 +702,7 @@ public open class SubsamplingScaleImageView @JvmOverloads constructor(
 								)
 							}
 							matrix2!!.setPolyToPoly(srcArray, 0, dstArray, 0, 4)
-							// Clip to tile rect before drawing. Without this, Android HWUI bilinear
-							// filter with a complex matrix can sample outside bitmap edges (DECAL
-							// instead of CLAMP), creating coloured semi-transparent fringes at every
-							// tile seam on tall images. Hardware scissor has zero extra cost.
-							canvas.save()
-							canvas.clipRect(tile.vRect)
 							canvas.drawBitmap(tileBitmap, matrix2!!, bitmapPaint)
-							canvas.restore()
 							if (isDebugDrawingEnabled) {
 								canvas.drawRect(tile.vRect, debugLinePaint!!)
 							}
@@ -934,17 +927,12 @@ public open class SubsamplingScaleImageView @JvmOverloads constructor(
 					val tile = Tile()
 					tile.sampleSize = sampleSize
 					tile.isVisible = sampleSize == fullImageSampleSize
-					// Align every tile boundary to 16-px JPEG/WebP chroma MCU boundary.
-					// BitmapRegionDecoder reads chroma in 16×16 MCU blocks; a tile edge that
-					// doesn't land on a 16-px multiple causes it to pull chroma from the wrong
-					// MCU, producing the coloured tint bands visible on tall strip images.
-					// Using floor() for both edges keeps adjacent tiles gapless and non-overlapping.
-					val mcu = 16
-					val tileLeft   = (x * sTileWidth  / mcu) * mcu
-					val tileTop    = (y * sTileHeight / mcu) * mcu
-					val tileRight  = if (x == xTiles - 1) sWidth()  else ((x + 1) * sTileWidth  / mcu) * mcu
-					val tileBottom = if (y == yTiles - 1) sHeight() else ((y + 1) * sTileHeight / mcu) * mcu
-					tile.sRect.set(tileLeft, tileTop, tileRight, tileBottom)
+					tile.sRect.set(
+						x * sTileWidth,
+						y * sTileHeight,
+						if (x == xTiles - 1) sWidth() else (x + 1) * sTileWidth,
+						if (y == yTiles - 1) sHeight() else (y + 1) * sTileHeight,
+					)
 					tile.vRect.set(0, 0, 0, 0)
 					tile.fileSRect.set(tile.sRect)
 					tileGrid.add(tile)
