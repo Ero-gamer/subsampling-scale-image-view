@@ -212,8 +212,14 @@ internal const val CHROMA_BLOCK_SIZE = 16
  * (since inSampleSize itself is always a power of 2 in SSIV).
  */
 internal fun effectiveChromaBlockSize(inSampleSize: Int): Int {
-    val s = inSampleSize.coerceAtLeast(1)
-    return CHROMA_BLOCK_SIZE * s
+    // The MCU boundary for JPEG 4:2:0 and WebP lossy is ALWAYS 16 pixels in
+    // SOURCE image space, regardless of inSampleSize. Multiplying by inSampleSize
+    // was wrong: it over-expanded alignment regions and made cropToRequestedRegion
+    // compute incorrect crop offsets (diff not divisible by sampleSize).
+    // The primary fix is in initialiseTileMap (tile boundaries are pre-aligned to
+    // 16px), so this path is now a safety-net for direct decodeRegion callers only.
+    @Suppress("UNUSED_PARAMETER")
+    return CHROMA_BLOCK_SIZE  // always 16; never multiply by inSampleSize
 }
 
 /**
