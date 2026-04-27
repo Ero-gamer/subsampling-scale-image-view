@@ -64,6 +64,9 @@ public open class SkiaPooledImageRegionDecoder @JvmOverloads constructor(
 	private val imageDimensions = Point(0, 0)
 	private val isLazyInited = AtomicBoolean(false)
 
+	// See SkiaImageRegionDecoder for explanation of this flag.
+	private var isLargeJpeg = false
+
 	/**
 	 * Initialises the decoder pool. This method creates one decoder on the current thread and uses
 	 * it to decode the bounds, then spawns an independent thread to populate the pool with an
@@ -201,6 +204,7 @@ public open class SkiaPooledImageRegionDecoder @JvmOverloads constructor(
 		} ?: throw ImageDecodeException.create(context, uri)
 		this.fileLength = fileLength
 		imageDimensions[decoder.width] = decoder.height
+		isLargeJpeg = decoder.height >= LARGE_JPEG_HEIGHT_THRESHOLD && isJpegUri(uri)
 		decoderLock.writeLock().lock()
 		try {
 			decoderPool?.add(decoder)
@@ -232,6 +236,8 @@ public open class SkiaPooledImageRegionDecoder @JvmOverloads constructor(
 						val options = BitmapFactory.Options().apply {
 							inSampleSize = sampleSize.coerceAtLeast(1)
 							inPreferredConfig = quality.toBitmapConfig()
+							// Force software JPEG decoder on large strips — see SkiaImageRegionDecoder.
+							if (isLargeJpeg) inPreferQualityOverSpeed = true
 						}
 						return decoder.decodeRegion(sRect, options)
 							?: throw ImageDecodeException.create(context, uri)
@@ -343,4 +349,13 @@ public open class SkiaPooledImageRegionDecoder @JvmOverloads constructor(
 		@set:JvmName("setDebug")
 		public var isDebug: Boolean = false
 	}
+	private companion object {
+		private const val LARGE_JPEG_HEIGHT_THRESHOLD = 5000
+
+		private fun isJpegUri(uri: Uri): Boolean {
+			val path = uri.path?.lowercase() ?: return false
+			return path.endsWith(".jpg") || path.endsWith(".jpeg")
+		}
+	}
+
 }
