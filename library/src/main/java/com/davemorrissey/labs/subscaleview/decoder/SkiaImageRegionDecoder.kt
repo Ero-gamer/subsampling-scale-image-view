@@ -24,20 +24,6 @@ import java.util.zip.ZipFile
 /**
  * Default [ImageRegionDecoder] using [BitmapRegionDecoder] (Skia).
  *
- * ### Chroma block alignment — green/blue tint fix (all formats, all Android versions)
- *
- * JPEG and WEBP lossy encode colour in 16×16 YCbCr minimum coding units (MCUs). When a
- * tile boundary does not fall on a 16-pixel multiple, [BitmapRegionDecoder] reads chroma
- * samples from the wrong MCU — producing green/blue horizontal bands on large strip images.
- *
- * When [BitmapRegionDecoder.decodeRegion] is called with `inSampleSize > 1`, the decoder
- * processes pixel groups of size `inSampleSize × inSampleSize`. The effective alignment
- * requirement becomes `inSampleSize × 16`. This decoder uses
- * `effectiveChromaBlockSize(inSampleSize)` to compute the correct alignment per decode call.
- *
- * Fix: expand the tile rect to the effective block boundary, decode the aligned region,
- * then crop the result back to the original pixels. Maximum overhead: ~15 × inSampleSize
- * extra pixels per edge — negligible vs. tile sizes of 256–512 px.
  *
  * ### Color quality
  *
@@ -65,12 +51,6 @@ public class SkiaImageRegionDecoder @JvmOverloads constructor(
 
     private var decoder: BitmapRegionDecoder? = null
     private val decoderLock: ReadWriteLock = ReentrantReadWriteLock(true)
-
-    /** Full image width — needed to clamp alignment expansion to the image boundary. */
-    private var imageWidth: Int = 0
-
-    /** Full image height — needed to clamp alignment expansion to the image boundary. */
-    private var imageHeight: Int = 0
 
     // ── init ──────────────────────────────────────────────────────────────────
 
@@ -124,9 +104,7 @@ public class SkiaImageRegionDecoder @JvmOverloads constructor(
         }
 
         decoder = brd
-        imageWidth = brd.width
-        imageHeight = brd.height
-        return Point(imageWidth, imageHeight)
+        return Point(brd.width, brd.height)
     }
 
     // ── decodeRegion ──────────────────────────────────────────────────────────
@@ -138,35 +116,12 @@ public class SkiaImageRegionDecoder @JvmOverloads constructor(
             val dec = decoder
             check(dec?.isRecycled == false) { "Cannot decode region — decoder recycled" }
             checkNotNull(dec) { "Decoder is null" }
-
-            val effectiveSampleSize = sampleSize.coerceAtLeast(1)
             val options = BitmapFactory.Options().apply {
-                inSampleSize = effectiveSampleSize
+                inSampleSize = sampleSize.coerceAtLeast(1)
                 inPreferredConfig = quality.toBitmapConfig()
-                // inScaled = false: prevent Android from applying display density scaling
-                // to the decoded bitmap, which would alter pixel dimensions unexpectedly.
-                inScaled = false
             }
-
-            // Compute the effective chroma block size for this decode.
-            // For inSampleSize=1: block=16. For inSampleSize=2: block=32. Etc.
-            // Using the larger block ensures correct chroma alignment even when the
-            // decoder processes multiple MCUs per output sample.
-            val blockSize = effectiveChromaBlockSize(effectiveSampleSize)
-
-            // Fast path: all edges already on block boundaries → no overhead.
-            if (sRect.isChromaAligned(imageWidth, imageHeight, blockSize)) {
-                return dec.decodeRegion(sRect, options)
-                    ?: error("BitmapRegionDecoder returned null for $sRect — " +
-                        "image may be corrupted or unsupported on this device")
-            }
-
-            // Slow path: expand → decode → crop to remove chroma corruption.
-            val aligned = sRect.alignToChromaBlocks(imageWidth, imageHeight, blockSize)
-            val rawBitmap = dec.decodeRegion(aligned, options)
-                ?: error("BitmapRegionDecoder returned null for aligned region $aligned")
-
-            cropToRequestedRegion(rawBitmap, sRect, aligned, effectiveSampleSize)
+            dec.decodeRegion(sRect, options)
+                ?: error("BitmapRegionDecoder returned null for $sRect")
         } finally {
             decodeLock.unlock()
         }
@@ -188,13 +143,8 @@ public class SkiaImageRegionDecoder @JvmOverloads constructor(
         }
     }
 
-    // BitmapRegionDecoder is NOT thread-safe. The readLock() would allow concurrent
-    // decodeRegion() calls from multiple coroutines (Dispatchers.Default thread pool),
-    // which corrupts the decoder's internal state and produces garbled/tinted tiles.
-    // Using writeLock() ensures mutual exclusion: only one decodeRegion() runs at a time,
-    // while still blocking recycle() from running concurrently with any active decode.
     private val decodeLock: Lock
-        get() = decoderLock.writeLock()
+        get() = decoderLock.readLock()
 
     // ── Factory ───────────────────────────────────────────────────────────────
 
