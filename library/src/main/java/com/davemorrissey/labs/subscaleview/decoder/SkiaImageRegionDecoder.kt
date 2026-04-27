@@ -52,6 +52,13 @@ public class SkiaImageRegionDecoder @JvmOverloads constructor(
     private var decoder: BitmapRegionDecoder? = null
     private val decoderLock: ReadWriteLock = ReentrantReadWriteLock(true)
 
+    // True when the image is a large JPEG/JPG strip (height >= 5000px).
+    // These images trigger a hardware JPEG decoder chroma bug on some devices,
+    // producing repeating coloured tint bands across the image. The flag is
+    // set once in init() and used to enable inPreferQualityOverSpeed in
+    // decodeRegion(), which forces the software JPEG decoder path.
+    private var isLargeJpeg = false
+
     // ── init ──────────────────────────────────────────────────────────────────
 
     @SuppressLint("DiscouragedApi")
@@ -104,6 +111,7 @@ public class SkiaImageRegionDecoder @JvmOverloads constructor(
         }
 
         decoder = brd
+        isLargeJpeg = brd.height >= LARGE_JPEG_HEIGHT_THRESHOLD && isJpegUri(uri)
         return Point(brd.width, brd.height)
     }
 
@@ -119,6 +127,12 @@ public class SkiaImageRegionDecoder @JvmOverloads constructor(
             val options = BitmapFactory.Options().apply {
                 inSampleSize = sampleSize.coerceAtLeast(1)
                 inPreferredConfig = quality.toBitmapConfig()
+                // Force software JPEG decoder on large strips to avoid a hardware
+                // chroma upsampler bug present on some Android devices (Qualcomm/
+                // MediaTek HAL) that produces repeating coloured tint bands.
+                // Deprecated in API 31 but harmless — it is a no-op on unaffected
+                // devices and has negligible performance impact for tiled decoding.
+                if (isLargeJpeg) inPreferQualityOverSpeed = true
             }
             dec.decodeRegion(sRect, options)
                 ?: error("BitmapRegionDecoder returned null for $sRect")
@@ -145,6 +159,19 @@ public class SkiaImageRegionDecoder @JvmOverloads constructor(
 
     private val decodeLock: Lock
         get() = decoderLock.readLock()
+
+    // ── Helpers ───────────────────────────────────────────────────────────────
+
+    private companion object {
+        /** Images taller than this (in source pixels) are considered large strips. */
+        private const val LARGE_JPEG_HEIGHT_THRESHOLD = 5000
+
+        /** Returns true if the URI path ends with .jpg or .jpeg (case-insensitive). */
+        private fun isJpegUri(uri: Uri): Boolean {
+            val path = uri.path?.lowercase() ?: return false
+            return path.endsWith(".jpg") || path.endsWith(".jpeg")
+        }
+    }
 
     // ── Factory ───────────────────────────────────────────────────────────────
 
