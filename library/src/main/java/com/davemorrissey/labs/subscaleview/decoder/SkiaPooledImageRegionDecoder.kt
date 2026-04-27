@@ -348,8 +348,7 @@ public open class SkiaPooledImageRegionDecoder @JvmOverloads constructor(
 		@Keep
 		@set:JvmName("setDebug")
 		public var isDebug: Boolean = false
-	}
-	private companion object {
+
 		private const val LARGE_JPEG_HEIGHT_THRESHOLD = 5000
 
 		private fun isJpegUri(uri: Uri): Boolean {
