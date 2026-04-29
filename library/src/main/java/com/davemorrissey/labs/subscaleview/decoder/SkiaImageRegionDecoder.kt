@@ -16,6 +16,11 @@ import com.davemorrissey.labs.subscaleview.internal.URI_SCHEME_CONTENT
 import com.davemorrissey.labs.subscaleview.internal.URI_SCHEME_FILE
 import com.davemorrissey.labs.subscaleview.internal.URI_SCHEME_RES
 import com.davemorrissey.labs.subscaleview.internal.URI_SCHEME_ZIP
+import android.graphics.ImageDecoder
+import android.os.Build
+import androidx.annotation.RequiresApi
+import java.io.File
+import java.nio.ByteBuffer
 import java.util.concurrent.locks.Lock
 import java.util.concurrent.locks.ReadWriteLock
 import java.util.concurrent.locks.ReentrantReadWriteLock
@@ -53,11 +58,27 @@ public class SkiaImageRegionDecoder @JvmOverloads constructor(
     private val decoderLock: ReadWriteLock = ReentrantReadWriteLock(true)
 
     // True when the image is a large JPEG/JPG strip (height >= 5000px).
-    // These images trigger a hardware JPEG decoder chroma bug on some devices,
-    // producing repeating coloured tint bands across the image. The flag is
-    // set once in init() and used to enable inPreferQualityOverSpeed in
-    // decodeRegion(), which forces the software JPEG decoder path.
+    // On some devices the hardware JPEG decoder (Qualcomm/MediaTek HAL) has a
+    // chroma upsampler bug that produces repeating coloured tint bands on such
+    // images. When true, decodeRegion() uses ImageDecoder (API 28+) with
+    // ALLOCATOR_SOFTWARE to route decoding through the software JPEG path.
     private var isLargeJpeg = false
+
+    // Context and URI retained from init() for the ImageDecoder software path.
+    private var imageContext: Context? = null
+    private var imageUri: Uri? = null
+
+    // Full source image dimensions cached so the ImageDecoder path can compute
+    // setTargetSize without touching the BitmapRegionDecoder (which requires decodeLock).
+    private var imageWidth: Int = 0
+    private var imageHeight: Int = 0
+
+    // Caches the last ImageDecoder-decoded full-image bitmap and the sampleSize it
+    // was decoded at. All tile requests at the same zoom level reuse this cache;
+    // only the crop rect changes. Guarded by overviewLock.
+    private val overviewLock = Any()
+    private var overviewBitmap: Bitmap? = null
+    private var overviewSampleSize: Int = 0
 
     // ── init ──────────────────────────────────────────────────────────────────
 
@@ -111,6 +132,10 @@ public class SkiaImageRegionDecoder @JvmOverloads constructor(
         }
 
         decoder = brd
+        imageContext = context
+        imageUri = uri
+        imageWidth = brd.width
+        imageHeight = brd.height
         isLargeJpeg = brd.height >= LARGE_JPEG_HEIGHT_THRESHOLD && isJpegUri(uri)
         return Point(brd.width, brd.height)
     }
@@ -119,6 +144,17 @@ public class SkiaImageRegionDecoder @JvmOverloads constructor(
 
     @WorkerThread
     override fun decodeRegion(sRect: Rect, sampleSize: Int): Bitmap {
+        // For large JPEG strip images at sampleSize >= 2, use ImageDecoder with
+        // ALLOCATOR_SOFTWARE instead of BitmapRegionDecoder. ImageDecoder routes
+        // through the software JPEG path, bypassing the hardware HAL chroma bug.
+        // Falls back to BitmapRegionDecoder on failure or when API < 28.
+        if (isLargeJpeg && sampleSize >= 2 && Build.VERSION.SDK_INT >= Build.VERSION_CODES.P) {
+            val ctx = imageContext
+            val u = imageUri
+            if (ctx != null && u != null) {
+                decodeViaImageDecoder(ctx, u, sRect, sampleSize)?.let { return it }
+            }
+        }
         decodeLock.lock()
         return try {
             val dec = decoder
@@ -127,12 +163,6 @@ public class SkiaImageRegionDecoder @JvmOverloads constructor(
             val options = BitmapFactory.Options().apply {
                 inSampleSize = sampleSize.coerceAtLeast(1)
                 inPreferredConfig = quality.toBitmapConfig()
-                // Force software JPEG decoder on large strips to avoid a hardware
-                // chroma upsampler bug present on some Android devices (Qualcomm/
-                // MediaTek HAL) that produces repeating coloured tint bands.
-                // Deprecated in API 31 but harmless — it is a no-op on unaffected
-                // devices and has negligible performance impact for tiled decoding.
-                if (isLargeJpeg) inPreferQualityOverSpeed = true
             }
             dec.decodeRegion(sRect, options)
                 ?: error("BitmapRegionDecoder returned null for $sRect")
@@ -152,13 +182,96 @@ public class SkiaImageRegionDecoder @JvmOverloads constructor(
         try {
             decoder?.recycle()
             decoder = null
+            imageContext = null
+            imageUri = null
         } finally {
             decoderLock.writeLock().unlock()
+        }
+        synchronized(overviewLock) {
+            overviewBitmap?.recycle()
+            overviewBitmap = null
         }
     }
 
     private val decodeLock: Lock
         get() = decoderLock.readLock()
+
+    // ── ImageDecoder software path (API 28+, large JPEG overview tiles only) ────
+
+    /**
+     * Decodes the full image at (imageWidth/sampleSize × imageHeight/sampleSize) using
+     * [ImageDecoder.ALLOCATOR_SOFTWARE], caches the result, then returns a crop of that
+     * cached bitmap matching [sRect]. All tile requests at the same [sampleSize] reuse
+     * the cached full-image bitmap — only one ImageDecoder decode per zoom level.
+     *
+     * Returns null if the source URI scheme is unsupported or decoding fails;
+     * the caller then falls back to [BitmapRegionDecoder].
+     */
+    @RequiresApi(Build.VERSION_CODES.P)
+    private fun decodeViaImageDecoder(
+        context: Context,
+        uri: Uri,
+        sRect: Rect,
+        sampleSize: Int,
+    ): Bitmap? {
+        val imgW = imageWidth.takeIf { it > 0 } ?: return null
+        val imgH = imageHeight.takeIf { it > 0 } ?: return null
+        val targetW = (imgW / sampleSize).coerceAtLeast(1)
+        val targetH = (imgH / sampleSize).coerceAtLeast(1)
+        return synchronized(overviewLock) {
+            // Decode the full image only when sampleSize changes or cache is empty.
+            if (overviewSampleSize != sampleSize || overviewBitmap?.isRecycled != false) {
+                overviewBitmap?.recycle()
+                overviewBitmap = null
+                try {
+                    val source = createImageDecoderSource(context, uri)
+                        ?: return@synchronized null
+                    overviewBitmap = ImageDecoder.decodeBitmap(source) { dec, _, _ ->
+                        dec.allocator = ImageDecoder.ALLOCATOR_SOFTWARE
+                        dec.setTargetSize(targetW, targetH)
+                    }
+                    overviewSampleSize = sampleSize
+                } catch (e: Exception) {
+                    return@synchronized null
+                }
+            }
+            val bmp = overviewBitmap ?: return@synchronized null
+            // Compute crop rect in decoded-image coordinates and return a new independent
+            // Bitmap. createBitmap() is called inside the lock so bmp cannot be recycled
+            // by a concurrent recycle() call while we read it.
+            val fw = bmp.width
+            val fh = bmp.height
+            val cropX = (sRect.left.toFloat() * fw / imgW).toInt().coerceIn(0, fw - 1)
+            val cropY = (sRect.top.toFloat() * fh / imgH).toInt().coerceIn(0, fh - 1)
+            val cropW = ((sRect.right.toFloat() * fw / imgW).toInt() - cropX)
+                .coerceIn(1, fw - cropX)
+            val cropH = ((sRect.bottom.toFloat() * fh / imgH).toInt() - cropY)
+                .coerceIn(1, fh - cropY)
+            Bitmap.createBitmap(bmp, cropX, cropY, cropW, cropH)
+        }
+    }
+
+    /**
+     * Creates an [ImageDecoder.Source] for content:// and file:// URIs.
+     * Returns null for res:// and zip:// URIs (rare; falls back to BitmapRegionDecoder).
+     */
+    @RequiresApi(Build.VERSION_CODES.P)
+    private fun createImageDecoderSource(context: Context, uri: Uri): ImageDecoder.Source? = try {
+        when (uri.scheme) {
+            URI_SCHEME_CONTENT -> ImageDecoder.createSource(context.contentResolver, uri)
+            URI_SCHEME_FILE -> {
+                val path = uri.schemeSpecificPart
+                if (path.startsWith(URI_PATH_ASSET, ignoreCase = true)) {
+                    val assetName = path.substring(URI_PATH_ASSET.length)
+                    val bytes = context.assets.open(assetName).use { it.readBytes() }
+                    ImageDecoder.createSource(ByteBuffer.wrap(bytes))
+                } else {
+                    ImageDecoder.createSource(File(path))
+                }
+            }
+            else -> null
+        }
+    } catch (e: Exception) { null }
 
     // ── Helpers ───────────────────────────────────────────────────────────────
 
