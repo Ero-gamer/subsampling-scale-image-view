@@ -40,6 +40,24 @@ android {
             proguardFiles getDefaultProguardFile('proguard-android-optimize.txt'), 'proguard-rules.pro'
         }
     }
+
+    externalNativeBuild {
+        cmake {
+            path "src/main/cpp/CMakeLists.txt"
+            version "3.22.1"
+        }
+    }
+
+    defaultConfig {
+        externalNativeBuild {
+            cmake {
+                // arm64-v8a: modern 64-bit Android (NEON SIMD enabled)
+                // armeabi-v7a: 32-bit ARM fallback
+                // x86_64: emulator support
+                abiFilters "arm64-v8a", "armeabi-v7a", "x86_64"
+            }
+        }
+    }
 } // This brace correctly closes the android block
 
 configurations {
