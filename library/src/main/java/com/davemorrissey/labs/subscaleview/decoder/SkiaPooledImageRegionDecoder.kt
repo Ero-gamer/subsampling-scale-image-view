@@ -14,7 +14,11 @@ import com.davemorrissey.labs.subscaleview.internal.URI_SCHEME_CONTENT
 import com.davemorrissey.labs.subscaleview.internal.URI_SCHEME_FILE
 import com.davemorrissey.labs.subscaleview.internal.URI_SCHEME_RES
 import com.davemorrissey.labs.subscaleview.internal.URI_SCHEME_ZIP
+import android.graphics.ImageDecoder
+import android.os.Build
+import androidx.annotation.RequiresApi
 import java.io.File
+import java.nio.ByteBuffer
 import java.util.concurrent.atomic.AtomicBoolean
 import java.util.concurrent.locks.ReadWriteLock
 import java.util.concurrent.locks.ReentrantReadWriteLock
@@ -66,6 +70,13 @@ public open class SkiaPooledImageRegionDecoder @JvmOverloads constructor(
 
 	// See SkiaImageRegionDecoder for explanation of this flag.
 	private var isLargeJpeg = false
+
+	private var imageWidth: Int = 0
+	private var imageHeight: Int = 0
+
+	private val overviewLock = Any()
+	private var overviewBitmap: Bitmap? = null
+	private var overviewSampleSize: Int = 0
 
 	/**
 	 * Initialises the decoder pool. This method creates one decoder on the current thread and uses
@@ -204,7 +215,11 @@ public open class SkiaPooledImageRegionDecoder @JvmOverloads constructor(
 		} ?: throw ImageDecodeException.create(context, uri)
 		this.fileLength = fileLength
 		imageDimensions[decoder.width] = decoder.height
-		isLargeJpeg = decoder.height >= LARGE_JPEG_HEIGHT_THRESHOLD && isJpegUri(uri)
+		if (imageWidth == 0) {
+			imageWidth = decoder.width
+			imageHeight = decoder.height
+			isLargeJpeg = decoder.height >= LARGE_JPEG_HEIGHT_THRESHOLD && isJpegUri(uri)
+		}
 		decoderLock.writeLock().lock()
 		try {
 			decoderPool?.add(decoder)
@@ -226,6 +241,16 @@ public open class SkiaPooledImageRegionDecoder @JvmOverloads constructor(
 		if (sRect.width() < imageDimensions.x || sRect.height() < imageDimensions.y) {
 			lazyInit()
 		}
+		// ImageDecoder software path for large JPEG strips (API 28+, sampleSize >= 2 only).
+		// sampleSize=1 (full-res tiles) falls back to BitmapRegionDecoder — decoding
+		// the full image at 1:1 into memory just to crop a tile is not practical.
+		if (isLargeJpeg && sampleSize >= 2 && Build.VERSION.SDK_INT >= Build.VERSION_CODES.P) {
+			val ctx = context
+			val u = uri
+			if (ctx != null && u != null) {
+				decodeViaImageDecoder(ctx, u, sRect, sampleSize)?.let { return it }
+			}
+		}
 		decoderLock.readLock().lock()
 		try {
 			if (decoderPool != null) {
@@ -236,8 +261,6 @@ public open class SkiaPooledImageRegionDecoder @JvmOverloads constructor(
 						val options = BitmapFactory.Options().apply {
 							inSampleSize = sampleSize.coerceAtLeast(1)
 							inPreferredConfig = quality.toBitmapConfig()
-							// Force software JPEG decoder on large strips — see SkiaImageRegionDecoder.
-							if (isLargeJpeg) inPreferQualityOverSpeed = true
 						}
 						return decoder.decodeRegion(sRect, options)
 							?: throw ImageDecodeException.create(context, uri)
@@ -277,6 +300,10 @@ public open class SkiaPooledImageRegionDecoder @JvmOverloads constructor(
 		} finally {
 			decoderLock.writeLock().unlock()
 		}
+		synchronized(overviewLock) {
+			overviewBitmap?.recycle()
+			overviewBitmap = null
+		}
 	}
 
 	/**
@@ -315,6 +342,66 @@ public open class SkiaPooledImageRegionDecoder @JvmOverloads constructor(
 			Log.d(TAG, message)
 		}
 	}
+
+	// ImageDecoder software path helpers (large JPEG strips, API 28+)
+
+	@RequiresApi(Build.VERSION_CODES.P)
+	private fun decodeViaImageDecoder(
+		context: Context,
+		uri: Uri,
+		sRect: Rect,
+		sampleSize: Int,
+	): Bitmap? {
+		val imgW = imageWidth.takeIf { it > 0 } ?: return null
+		val imgH = imageHeight.takeIf { it > 0 } ?: return null
+		val targetW = (imgW / sampleSize).coerceAtLeast(1)
+		val targetH = (imgH / sampleSize).coerceAtLeast(1)
+		return synchronized(overviewLock) {
+			if (overviewSampleSize != sampleSize || overviewBitmap?.isRecycled != false) {
+				overviewBitmap?.recycle()
+				overviewBitmap = null
+				try {
+					val source = createImageDecoderSource(context, uri)
+						?: return@synchronized null
+					overviewBitmap = ImageDecoder.decodeBitmap(source) { dec, _, _ ->
+						dec.allocator = ImageDecoder.ALLOCATOR_SOFTWARE
+						dec.setTargetSize(targetW, targetH)
+					}
+					overviewSampleSize = sampleSize
+				} catch (e: Exception) {
+					return@synchronized null
+				}
+			}
+			val bmp = overviewBitmap ?: return@synchronized null
+			val fw = bmp.width
+			val fh = bmp.height
+			val cropX = (sRect.left.toFloat() * fw / imgW).toInt().coerceIn(0, fw - 1)
+			val cropY = (sRect.top.toFloat() * fh / imgH).toInt().coerceIn(0, fh - 1)
+			val cropW = ((sRect.right.toFloat() * fw / imgW).toInt() - cropX)
+				.coerceIn(1, fw - cropX)
+			val cropH = ((sRect.bottom.toFloat() * fh / imgH).toInt() - cropY)
+				.coerceIn(1, fh - cropY)
+			Bitmap.createBitmap(bmp, cropX, cropY, cropW, cropH)
+		}
+	}
+
+	@RequiresApi(Build.VERSION_CODES.P)
+	private fun createImageDecoderSource(context: Context, uri: Uri): ImageDecoder.Source? = try {
+		when (uri.scheme) {
+			URI_SCHEME_CONTENT -> ImageDecoder.createSource(context.contentResolver, uri)
+			URI_SCHEME_FILE -> {
+				val path = uri.schemeSpecificPart
+				if (path.startsWith(URI_PATH_ASSET, ignoreCase = true)) {
+					val assetName = path.substring(URI_PATH_ASSET.length)
+					val bytes = context.assets.open(assetName).use { it.readBytes() }
+					ImageDecoder.createSource(ByteBuffer.wrap(bytes))
+				} else {
+					ImageDecoder.createSource(File(path))
+				}
+			}
+			else -> null
+		}
+	} catch (e: Exception) { null }
 
 	public class Factory @JvmOverloads constructor(
 		public val quality: BitmapQuality = BitmapQuality.STANDARD,
