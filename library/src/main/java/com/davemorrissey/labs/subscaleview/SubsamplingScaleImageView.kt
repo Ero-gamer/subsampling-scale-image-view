@@ -280,7 +280,11 @@ public open class SubsamplingScaleImageView @JvmOverloads constructor(
 	// RGBA_F16 ("HIGH") has been removed — it doubled memory per tile with no visible
 	// benefit on standard sRGB displays.
 	public var bitmapDecoderFactory: DecoderFactory<out ImageDecoder> = SkiaImageDecoder.Factory()
-	public var regionDecoderFactory: DecoderFactory<out ImageRegionDecoder> = SkiaImageRegionDecoder.Factory()
+	// LiJpegTurboRegionDecoder is the default: it uses libjpeg-turbo (software JPEG
+	// decoder via JNI) for large JPEG strip images (height >= 5000px) to bypass the
+	// hardware HAL chroma-upsampler bug that produces coloured tint bands on some
+	// devices. All other images fall back to BitmapRegionDecoder (Skia/hardware).
+	public var regionDecoderFactory: DecoderFactory<out ImageRegionDecoder> = LiJpegTurboRegionDecoder.Factory()
 
 	// Debug values
 	protected val isDebugDrawingEnabled: Boolean
