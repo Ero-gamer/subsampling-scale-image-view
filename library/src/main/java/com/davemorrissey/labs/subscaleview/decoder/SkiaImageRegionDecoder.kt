@@ -131,7 +131,7 @@ public class SkiaImageRegionDecoder @JvmOverloads constructor(
             },
         )
 
-        public val bitmapConfig: Bitmap.Config
+        public override val bitmapConfig: Bitmap.Config
             get() = quality.toBitmapConfig()
 
         override fun make(): SkiaImageRegionDecoder = SkiaImageRegionDecoder(quality)
