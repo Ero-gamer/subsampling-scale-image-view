@@ -36,6 +36,7 @@ import com.davemorrissey.labs.subscaleview.decoder.DecoderFactory
 import com.davemorrissey.labs.subscaleview.decoder.ImageDecoder
 import com.davemorrissey.labs.subscaleview.decoder.ImageRegionDecoder
 import com.davemorrissey.labs.subscaleview.decoder.SkiaImageDecoder
+import com.davemorrissey.labs.subscaleview.decoder.LiJpegTurboRegionDecoder
 import com.davemorrissey.labs.subscaleview.decoder.SkiaImageRegionDecoder
 import com.davemorrissey.labs.subscaleview.decoder.toUri
 import com.davemorrissey.labs.subscaleview.internal.Anim
