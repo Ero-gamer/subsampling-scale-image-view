@@ -262,7 +262,7 @@ private fun openBitmapRegionDecoder(context: Context, uri: Uri): android.graphic
                 File(path).inputStream()
             }
         }
-        else -> throw UnsupportedUriException(uri)
+        else -> throw UnsupportedUriException(uri.toString())
     } ?: throw IllegalStateException("Cannot open stream for $uri")
 
     return if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.S) {
