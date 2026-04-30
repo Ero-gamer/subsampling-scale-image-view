@@ -246,6 +246,10 @@ public class LiJpegTurboRegionDecoder(
     public class Factory @JvmOverloads constructor(
         private val quality: BitmapQuality = BitmapQuality.STANDARD,
     ) : DecoderFactory<LiJpegTurboRegionDecoder> {
+        // Required by DecoderFactory — applyBitmapConfig() in the app compares
+        // this value to decide whether to reinstall the factory.
+        override val bitmapConfig: Bitmap.Config
+            get() = quality.toBitmapConfig()
         override fun make(): LiJpegTurboRegionDecoder = LiJpegTurboRegionDecoder(quality)
     }
 
