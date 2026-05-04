@@ -9,7 +9,8 @@ Subsampling Scale Image View Library (Enhanced Version based on Kotatsu SSIV For
 
 - Fixed and upgraded default image decoder to use ARGB_8888. (High Quality)
 - Fixed visual bugs & optimizated performance.
-- Updated dependencies & QOL improvements.
+- Updated dependencies, bug fixes & improvements.
+- Implemented jpeg turbo lib as default jpeg decoder.
 
 # Kotatsu SSIV Differences from [upstream](https://github.com/davemorrissey/subsampling-scale-image-view)
 
