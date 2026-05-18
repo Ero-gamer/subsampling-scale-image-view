@@ -65,7 +65,7 @@ configurations {
 }
 
 dependencies {
-    implementation 'org.jetbrains.kotlin:kotlin-stdlib:2.3.20'
+    implementation 'org.jetbrains.kotlin:kotlin-stdlib:2.3.21'
     implementation "androidx.customview:customview:1.2.0"
     javadocs 'androidx.annotation:annotation:1.10.0'
     javadocs 'androidx.exifinterface:exifinterface:1.4.2'
