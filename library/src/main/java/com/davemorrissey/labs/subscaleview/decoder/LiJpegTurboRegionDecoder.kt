@@ -69,12 +69,15 @@ public class LiJpegTurboRegionDecoder(
             imageWidth  = brd.width
             imageHeight = brd.height
 
-            // Detect JPEG by magic bytes — works for all URI schemes including
-            // content:// (no extension) and file+zip:// (CBZ archives).
-            val bytes = readBytes(context, uri)
-            if (bytes != null && isJpegMagic(bytes)) {
-                jpegBytes = bytes
-                isJpeg    = true
+            // Peek only the first 3 bytes to detect JPEG magic (FF D8 FF).
+            // The previous approach called readBytes() — reading the ENTIRE file — just to check
+            // these 3 bytes, wasting 200 KB–5 MB per non-JPEG page (WebP/PNG processed cache,
+            // PNG webtoon strips). We now read the full bytes only when it IS a JPEG so that
+            // libjpeg-turbo can use them for per-tile region decodes.
+            val header = readFirstBytes(context, uri, 3)
+            if (header != null && isJpegMagic(header)) {
+                jpegBytes = readBytes(context, uri)
+                isJpeg    = jpegBytes != null
             }
         } finally {
             decoderLock.writeLock().unlock()
@@ -236,6 +239,52 @@ public class LiJpegTurboRegionDecoder(
                     try { id = segments[0].toInt() } catch (_: NumberFormatException) {}
                 }
                 context.resources.openRawResource(id).use { it.readBytes() }
+            }
+            else -> null
+        }
+    } catch (_: Exception) { null }
+
+    /**
+     * Reads only the first [count] bytes of the image at [uri]. Used to peek at the JPEG
+     * magic bytes (FF D8 FF) without reading the entire file — avoids allocating and
+     * discarding multi-megabyte ByteArrays for every non-JPEG page during [init].
+     */
+    @SuppressLint("DiscouragedApi")
+    private fun readFirstBytes(context: Context, uri: Uri, count: Int): ByteArray? = try {
+        fun java.io.InputStream.peekFirst(n: Int): ByteArray? {
+            val buf = ByteArray(n)
+            return if (read(buf) == n) buf else null
+        }
+        when (uri.scheme) {
+            URI_SCHEME_CONTENT ->
+                context.contentResolver.openInputStream(uri)?.use { it.peekFirst(count) }
+            URI_SCHEME_ZIP -> ZipFile(uri.schemeSpecificPart).use { zip ->
+                val entry = zip.getEntry(uri.fragment) ?: return null
+                zip.getInputStream(entry).use { it.peekFirst(count) }
+            }
+            URI_SCHEME_FILE -> {
+                val path = uri.schemeSpecificPart
+                if (path.startsWith(URI_PATH_ASSET, ignoreCase = true)) {
+                    context.assets.open(path.substring(URI_PATH_ASSET.length)).use { it.peekFirst(count) }
+                } else {
+                    File(path).inputStream().use { it.peekFirst(count) }
+                }
+            }
+            URI_SCHEME_RES -> {
+                val packageName = uri.authority
+                val res = if (packageName == null || context.packageName == packageName) {
+                    context.resources
+                } else {
+                    context.packageManager.getResourcesForApplication(packageName)
+                }
+                var id = 0
+                val segments = uri.pathSegments
+                if (segments.size == 2 && segments[0] == "drawable") {
+                    id = res.getIdentifier(segments[1], "drawable", packageName)
+                } else if (segments.size == 1 && TextUtils.isDigitsOnly(segments[0])) {
+                    try { id = segments[0].toInt() } catch (_: NumberFormatException) {}
+                }
+                context.resources.openRawResource(id).use { it.peekFirst(count) }
             }
             else -> null
         }
