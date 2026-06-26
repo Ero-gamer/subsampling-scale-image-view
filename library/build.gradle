@@ -10,7 +10,7 @@ archivesBaseName = 'subsampling-scale-image-view-androidx'
 version = '4.3.1'
 
 android {
-    compileSdk = 34
+    compileSdk = 35
     namespace = 'com.davemorrissey.labs.subscaleview'
     
     // This must be INSIDE the android block
@@ -20,7 +20,7 @@ android {
 	
     defaultConfig {
         minSdk = 23
-        targetSdk = 34
+        targetSdk = 35
         consumerProguardFiles 'proguard-rules.txt'
     }
 
@@ -72,7 +72,7 @@ dependencies {
     implementation 'androidx.annotation:annotation:1.10.0'
     implementation 'androidx.exifinterface:exifinterface:1.4.2'
     implementation 'androidx.lifecycle:lifecycle-runtime-ktx:2.10.0'
-    implementation 'org.jetbrains.kotlinx:kotlinx-coroutines-android:1.10.2'
+    implementation 'org.jetbrains.kotlinx:kotlinx-coroutines-android:1.11.0'
 }
 
 afterEvaluate {

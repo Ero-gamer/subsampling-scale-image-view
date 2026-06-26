@@ -61,20 +61,19 @@ public class FilteringRegionDecoder(
         val h = tile.height
         if (w <= 0 || h <= 0) return tile
 
-        // Ensure ARGB_8888 — getPixels/setPixels require software-backed 32-bit bitmaps.
         val working = if (tile.config != Bitmap.Config.ARGB_8888 || !tile.isMutable) {
             tile.copy(Bitmap.Config.ARGB_8888, true).also { tile.recycle() }
         } else {
             tile
         }
 
-        val src = IntArray(w * h)
+        val pixelCount = w * h
+        val src = srcPool.acquire(pixelCount)
         working.getPixels(src, 0, w, 0, 0, w, h)
 
         val k = if (doSharpen) kernelStrength(sharpening) else 0f
-        // When sharpening is active, we need a separate output array (reads from src,
-        // writes to out) to avoid corrupting neighbours mid-pass.
-        val out = if (doSharpen) IntArray(w * h) else src
+        // Sharpening reads src while writing to out to avoid corrupting neighbour pixels mid-pass.
+        val out = if (doSharpen) outPool.acquire(pixelCount) else src
 
         for (y in 0 until h) {
             val rowStart = y * w
@@ -194,11 +193,41 @@ public class FilteringRegionDecoder(
             FilteringRegionDecoder(innerFactory.make(), sharpening, vibrance)
     }
 
-    // ── companion ────────────────────────────────────────────────────────────
+    // ── pixel buffer pool ─────────────────────────────────────────────────────
 
+    /**
+     * Thread-local pools for the src and out pixel arrays used by [applyFilters].
+     *
+     * SSIV dispatches tile decodes on [Dispatchers.Default] (shared thread pool, typically
+     * CPU-count threads). Each thread reuses the same IntArray across tiles, eliminating
+     * the 1–2 × w*h × 4-byte allocations and subsequent GC pauses that caused jank during
+     * fast webtoon scroll on low-RAM / Cortex-A53 devices.
+     *
+     * Arrays grow on demand (coerced to a power-of-two capacity for alignment) and are
+     * never shrunk — the largest tile seen by a thread defines its steady-state allocation.
+     * On a 1080px-wide strip with 512px tiles that is one allocation of ~2 MB per thread,
+     * amortised over thousands of tile decodes.
+     */
     private companion object {
         private const val SHARPEN_SCALAR  = 0.5f
         private const val VIBRANCE_SCALAR = 1.5f
         private val ALPHA_MASK = 0xFF000000.toInt()
+
+        // Two pools: src (always needed) and out (only when sharpening, because sharpening
+        // must read from src while writing to out to avoid corrupting neighbour pixels).
+        private val srcPool = ThreadLocal<IntArray>()
+        private val outPool = ThreadLocal<IntArray>()
+
+        /** Returns a thread-local array of at least [minSize] ints, growing if necessary. */
+        private fun ThreadLocal<IntArray>.acquire(minSize: Int): IntArray {
+            val existing = get()
+            if (existing != null && existing.size >= minSize) return existing
+            // Round up to next power of two to reduce reallocations on incrementally larger tiles.
+            var cap = minSize.coerceAtLeast(1024)
+            cap = Integer.highestOneBit(cap - 1) shl 1
+            val arr = IntArray(cap)
+            set(arr)
+            return arr
+        }
     }
 }
