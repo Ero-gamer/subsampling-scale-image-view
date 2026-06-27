@@ -1404,6 +1404,12 @@ public open class SubsamplingScaleImageView @JvmOverloads constructor(
 		) {
 			initialiseBaseLayer(Point(maxTileWidth, maxTileHeight))
 		}
+		// Force-requeue any tiles that were discarded during the previous generation
+		// (bitmap=null, isValid=false, isLoading=false). Without this, those tiles stay
+		// blank until the next scroll event triggers a draw + refreshRequiredTiles.
+		// This is the primary cause of partial blank regions after reloadImage().
+		tileMap?.invalidateAll()
+		refreshRequiredTiles(load = true)
 		invalidate()
 		requestLayout()
 	}

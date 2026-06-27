@@ -181,10 +181,13 @@ Java_com_davemorrissey_labs_subscaleview_decoder_LiJpegTurboRegionDecoder_native
 
     // ── 6. Compute inner crop (aligned → exact sRect) in scaled-pixel space ──
     double scale = (double)sf.num / sf.denom;
-    int inner_x = (int)((sRect_left - aligned_left) * scale);
-    int inner_y = (int)((sRect_top  - aligned_top)  * scale);
-    int inner_w = (int)ceil((sRect_right  - sRect_left) * scale);
-    int inner_h = (int)ceil((sRect_bottom - sRect_top)  * scale);
+    // Use lround() for all four values. Mixing truncation (int cast) for offsets
+    // with ceil() for dimensions caused adjacent tiles to overlap or gap by 1 pixel
+    // at scale < 1.0, producing a shifted memcpy that looked blurred at tile seams.
+    int inner_x = (int)lround((sRect_left - aligned_left) * scale);
+    int inner_y = (int)lround((sRect_top  - aligned_top)  * scale);
+    int inner_w = (int)lround((sRect_right  - sRect_left) * scale);
+    int inner_h = (int)lround((sRect_bottom - sRect_top)  * scale);
     // Clamp to decoded buffer bounds.
     if (inner_x < 0) inner_x = 0;
     if (inner_y < 0) inner_y = 0;
