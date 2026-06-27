@@ -57,6 +57,9 @@ public class LiJpegTurboRegionDecoder(
     private var imageWidth:  Int = 0
     private var imageHeight: Int = 0
 
+    // URI of the current image — stored so recycle() can evict from the byte cache.
+    private var currentUri: Uri? = null
+
     // ── init ──────────────────────────────────────────────────────────────────
 
     @SuppressLint("DiscouragedApi")
@@ -68,16 +71,28 @@ public class LiJpegTurboRegionDecoder(
             decoder     = brd
             imageWidth  = brd.width
             imageHeight = brd.height
+            currentUri  = uri
 
-            // Peek only the first 3 bytes to detect JPEG magic (FF D8 FF).
-            // The previous approach called readBytes() — reading the ENTIRE file — just to check
-            // these 3 bytes, wasting 200 KB–5 MB per non-JPEG page (WebP/PNG processed cache,
-            // PNG webtoon strips). We now read the full bytes only when it IS a JPEG so that
-            // libjpeg-turbo can use them for per-tile region decodes.
-            val header = readFirstBytes(context, uri, 3)
-            if (header != null && isJpegMagic(header)) {
-                jpegBytes = readBytes(context, uri)
-                isJpeg    = jpegBytes != null
+            // Check the cross-decoder cache first — reloadImage() for the same URI
+            // (e.g. when filter params change) creates a new decoder instance but the
+            // file bytes haven't changed. Reading a 2-3 MB JPEG again under low-RAM
+            // conditions (2GB device) caused OOM crashes on every filter slider change.
+            val uriKey = uri.toString()
+            val cached = byteCache[uriKey]?.get()
+            if (cached != null) {
+                jpegBytes = cached
+                isJpeg    = true
+            } else {
+                // Peek only the first 3 bytes to detect JPEG magic (FF D8 FF).
+                val header = readFirstBytes(context, uri, 3)
+                if (header != null && isJpegMagic(header)) {
+                    val bytes = readBytes(context, uri)
+                    if (bytes != null) {
+                        jpegBytes = bytes
+                        isJpeg    = true
+                        byteCache[uriKey] = java.lang.ref.WeakReference(bytes)
+                    }
+                }
             }
         } finally {
             decoderLock.writeLock().unlock()
@@ -135,6 +150,10 @@ public class LiJpegTurboRegionDecoder(
         } finally {
             decoderLock.writeLock().unlock()
         }
+        // Evict from cache when this page is unloaded (chapter switch, reader close).
+        // WeakReference allows GC to collect the bytes under memory pressure even
+        // before recycle() is called, so this is a best-effort eviction only.
+        currentUri?.let { byteCache.remove(it.toString()) }
         jpegBytes = null
     }
 
@@ -305,6 +324,22 @@ public class LiJpegTurboRegionDecoder(
     // ── Companion ─────────────────────────────────────────────────────────────
 
     public companion object {
+
+        /**
+         * Cross-instance cache of JPEG byte arrays keyed by URI string.
+         *
+         * When [reloadImage] is triggered by a filter change (e.g. sharpening slider),
+         * SSIV creates a fresh [LiJpegTurboRegionDecoder] instance and calls [init] again
+         * for the SAME URI. Without this cache, every filter change reads the entire JPEG
+         * from disk/zip again (~2–5 MB per page), which on a 2 GB RAM device with ~337 KB
+         * free causes an OOM crash (java.lang.OutOfMemoryError in ByteArrayOutputStream).
+         *
+         * [WeakReference] allows the GC to collect byte arrays under memory pressure
+         * without requiring explicit eviction. [recycle] performs a best-effort eviction
+         * when the page is unloaded. The map itself stays small: one entry per active SSIV
+         * instance (one per visible webtoon page / standard reader page).
+         */
+        private val byteCache = java.util.concurrent.ConcurrentHashMap<String, java.lang.ref.WeakReference<ByteArray>>()
 
         /**
          * Detects JPEG by magic bytes FF D8 FF — works for all URI schemes
