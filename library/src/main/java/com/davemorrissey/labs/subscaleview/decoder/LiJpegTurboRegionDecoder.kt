@@ -57,6 +57,9 @@ public class LiJpegTurboRegionDecoder(
     private var imageWidth:  Int = 0
     private var imageHeight: Int = 0
 
+    // URI string for cache eviction in recycle().
+    private var sourceUriKey: String? = null
+
     // ── init ──────────────────────────────────────────────────────────────────
 
     @SuppressLint("DiscouragedApi")
@@ -68,16 +71,30 @@ public class LiJpegTurboRegionDecoder(
             decoder     = brd
             imageWidth  = brd.width
             imageHeight = brd.height
+            sourceUriKey = uri.toString()
 
-            // Peek only the first 3 bytes to detect JPEG magic (FF D8 FF).
-            // The previous approach called readBytes() — reading the ENTIRE file — just to check
-            // these 3 bytes, wasting 200 KB–5 MB per non-JPEG page (WebP/PNG processed cache,
-            // PNG webtoon strips). We now read the full bytes only when it IS a JPEG so that
-            // libjpeg-turbo can use them for per-tile region decodes.
-            val header = readFirstBytes(context, uri, 3)
-            if (header != null && isJpegMagic(header)) {
-                jpegBytes = readBytes(context, uri)
-                isJpeg    = jpegBytes != null
+            // Check the process-level SoftReference cache first.
+            // reloadImage() (triggered by filter changes) creates a new decoder instance
+            // for the same URI. Without caching, each init() calls readBytes() which
+            // allocates a ByteArrayOutputStream growing to the full file size (~1.5–5 MB).
+            // On a 2 GB device with 200 KB free this causes OOM (ByteArrayOutputStream.toByteArray
+            // copies the internal buffer into a new array at exactly that size).
+            // SoftReference allows GC to reclaim the bytes under memory pressure.
+            val key = sourceUriKey!!
+            val cached = byteCache[key]?.get()
+            if (cached != null) {
+                jpegBytes = cached
+                isJpeg    = true
+            } else {
+                val header = readFirstBytes(context, uri, 3)
+                if (header != null && isJpegMagic(header)) {
+                    val bytes = readBytes(context, uri)
+                    if (bytes != null) {
+                        jpegBytes = bytes
+                        isJpeg    = true
+                        byteCache[key] = java.lang.ref.SoftReference(bytes)
+                    }
+                }
             }
         } finally {
             decoderLock.writeLock().unlock()
@@ -135,6 +152,11 @@ public class LiJpegTurboRegionDecoder(
         } finally {
             decoderLock.writeLock().unlock()
         }
+        // Remove from cache when page is unloaded so stale entries don't accumulate.
+        // SoftReference already allows GC collection under pressure, but explicit
+        // removal on page unload keeps the map small (one entry per loaded page).
+        sourceUriKey?.let { byteCache.remove(it) }
+        sourceUriKey = null
         jpegBytes = null
     }
 
@@ -307,9 +329,20 @@ public class LiJpegTurboRegionDecoder(
     public companion object {
 
         /**
-         * Detects JPEG by magic bytes FF D8 FF — works for all URI schemes
-         * regardless of file extension.
+         * Process-level SoftReference cache of JPEG bytes keyed by URI string.
+         *
+         * reloadImage() (e.g. triggered by filter changes) creates a new
+         * [LiJpegTurboRegionDecoder] instance for the same URI. Without this cache,
+         * every init() calls readBytes() → ByteArrayOutputStream.toByteArray() which
+         * copies the buffer into a new array at exactly the file size. On a 2 GB device
+         * with only ~200 KB free this causes OOM before tiles even begin decoding.
+         *
+         * [SoftReference] lets the GC collect entries under memory pressure without
+         * requiring explicit coordination. [recycle] performs best-effort eviction
+         * when a page holder is unloaded, keeping the map bounded to active pages.
          */
+        private val byteCache = java.util.concurrent.ConcurrentHashMap<String, java.lang.ref.SoftReference<ByteArray>>()
+
         private fun isJpegMagic(bytes: ByteArray): Boolean =
             bytes.size >= 3 &&
             bytes[0] == 0xFF.toByte() &&
