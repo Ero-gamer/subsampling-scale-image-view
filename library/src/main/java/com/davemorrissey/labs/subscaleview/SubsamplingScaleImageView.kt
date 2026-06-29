@@ -181,8 +181,8 @@ public open class SubsamplingScaleImageView @JvmOverloads constructor(
 		}
 
 	// overrides for the dimensions of the generated tiles
-	private var maxTileWidth: Int = TILE_SIZE_AUTO
-	private var maxTileHeight: Int = TILE_SIZE_AUTO
+	protected var maxTileWidth: Int = TILE_SIZE_AUTO
+	protected var maxTileHeight: Int = TILE_SIZE_AUTO
 
 	public var backgroundDispatcher: CoroutineDispatcher = Dispatchers.Default
 
