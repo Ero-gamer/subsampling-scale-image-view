@@ -57,7 +57,9 @@ public class LiJpegTurboRegionDecoder(
     private var imageWidth:  Int = 0
     private var imageHeight: Int = 0
 
-    // URI string key used to evict from byteCache on recycle().
+    // URI string key for this decoder's cache entry. Used only to null out local
+    // state on recycle() — the shared byteCache entry itself is intentionally NOT
+    // evicted here (see recycle() for why).
     private var sourceUriKey: String? = null
 
     // ── init ──────────────────────────────────────────────────────────────────
@@ -83,8 +85,10 @@ public class LiJpegTurboRegionDecoder(
             // trace). On a 2 GB device with only ~200 KB free this causes OOM.
             //
             // SoftReference allows GC to reclaim bytes under memory pressure without
-            // any explicit coordination. recycle() performs a best-effort eviction so
-            // the map stays bounded to currently-active pages.
+            // any explicit coordination. recycle() does NOT evict this entry (see the
+            // comment there for why) — only already-cleared entries get pruned, and
+            // only occasionally, so the map stays small without ever invalidating a
+            // still-useful cache hit.
             val cached = byteCache[key]?.get()
             if (cached != null) {
                 jpegBytes = cached
@@ -156,7 +160,22 @@ public class LiJpegTurboRegionDecoder(
         } finally {
             decoderLock.writeLock().unlock()
         }
-        sourceUriKey?.let { byteCache.remove(it) }
+        // IMPORTANT: do NOT remove byteCache[sourceUriKey] here.
+        //
+        // reset(true) (called by setImage()/reloadImage()) recycles the OLD decoder
+        // SYNCHRONOUSLY, on the calling thread, BEFORE the NEW decoder is created and
+        // its init() runs on a worker thread. Both decoders share the same URI when
+        // reloadImage() is triggered by a filter change. Evicting the cache entry here
+        // would delete it one step before the new decoder's init() looks it up — turning
+        // every cache lookup on the exact scenario this cache exists for into a guaranteed
+        // miss, silently defeating the whole optimization and re-introducing the OOM in
+        // readBytes() that this cache was built to prevent.
+        //
+        // SoftReference already bounds memory under pressure: the GC clears the byte[]
+        // referent before throwing OOM, so cached entries never cause an OOM themselves.
+        // Opportunistic pruning (below) bounds unbounded key growth over very long
+        // reading sessions without ever discarding a still-valid, reusable entry.
+        pruneClearedCacheEntriesOpportunistically()
         sourceUriKey = null
         jpegBytes    = null
     }
@@ -335,10 +354,28 @@ public class LiJpegTurboRegionDecoder(
          * Eliminates redundant disk reads when the same URI is decoded by multiple
          * [LiJpegTurboRegionDecoder] instances (e.g. after reloadImage() creates a new
          * decoder for an already-loaded page). SoftReference lets GC reclaim entries
-         * under memory pressure. [recycle] explicitly evicts when a page is unloaded.
+         * under memory pressure — entries are NEVER explicitly evicted on recycle()
+         * (see comment in [recycle]); only already-cleared entries are pruned, and only
+         * occasionally, to bound key growth over very long reading sessions.
          */
         private val byteCache =
             java.util.concurrent.ConcurrentHashMap<String, java.lang.ref.SoftReference<ByteArray>>()
+
+        private val recycleCount = java.util.concurrent.atomic.AtomicInteger(0)
+
+        /**
+         * Removes entries whose SoftReference has already been cleared by the GC.
+         * Never removes a live entry — safe to call at any time. Runs every 64th
+         * recycle() call so the cost (a full map scan) stays negligible relative to
+         * page turn frequency.
+         */
+        private fun pruneClearedCacheEntriesOpportunistically() {
+            if (recycleCount.incrementAndGet() % 64 != 0) return
+            val it = byteCache.entries.iterator()
+            while (it.hasNext()) {
+                if (it.next().value.get() == null) it.remove()
+            }
+        }
 
         private fun isJpegMagic(bytes: ByteArray): Boolean =
             bytes.size >= 3 &&
