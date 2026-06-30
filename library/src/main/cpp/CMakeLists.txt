@@ -14,8 +14,8 @@ set(LJPEG_LIB         "${LJPEG_INSTALL_DIR}/lib/libturbojpeg.a")
 
 ExternalProject_Add(libjpeg_turbo_ext
     PREFIX      "${LJPEG_PREFIX}"
-    URL         https://github.com/libjpeg-turbo/libjpeg-turbo/releases/download/3.1.4.1/libjpeg-turbo-3.1.4.1.tar.gz
-    URL_HASH    SHA256=ecae8008e2cc9ade2f2c1bb9d5e6d4fb73e7c433866a056bd82980741571a022
+    URL         https://github.com/libjpeg-turbo/libjpeg-turbo/releases/download/3.2.0/libjpeg-turbo-3.2.0.tar.gz
+    URL_HASH    SHA256=6f30092cef9fb839779646608f4ee14ae3cbac98c47fa05e841b0841f09878e
 
     CMAKE_ARGS
         # Android cross-compilation — forward every variable AGP passes to us
