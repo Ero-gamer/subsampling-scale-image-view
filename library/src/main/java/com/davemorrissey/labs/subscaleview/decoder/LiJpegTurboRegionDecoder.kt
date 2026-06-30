@@ -57,7 +57,7 @@ public class LiJpegTurboRegionDecoder(
     private var imageWidth:  Int = 0
     private var imageHeight: Int = 0
 
-    // URI string for cache eviction in recycle().
+    // URI string key used to evict from byteCache on recycle().
     private var sourceUriKey: String? = null
 
     // ── init ──────────────────────────────────────────────────────────────────
@@ -71,16 +71,20 @@ public class LiJpegTurboRegionDecoder(
             decoder     = brd
             imageWidth  = brd.width
             imageHeight = brd.height
-            sourceUriKey = uri.toString()
+            val key = uri.toString()
+            sourceUriKey = key
 
-            // Check the process-level SoftReference cache first.
-            // reloadImage() (triggered by filter changes) creates a new decoder instance
-            // for the same URI. Without caching, each init() calls readBytes() which
-            // allocates a ByteArrayOutputStream growing to the full file size (~1.5–5 MB).
-            // On a 2 GB device with 200 KB free this causes OOM (ByteArrayOutputStream.toByteArray
-            // copies the internal buffer into a new array at exactly that size).
-            // SoftReference allows GC to reclaim the bytes under memory pressure.
-            val key = sourceUriKey!!
+            // Check the process-level SoftReference cache before reading from disk.
+            //
+            // reloadImage() — triggered by filter changes — creates a new decoder
+            // instance for the same URI. Without caching, every init() allocates a
+            // ByteArrayOutputStream that grows to file size (~1–5 MB) and then copies
+            // the entire buffer via Arrays.copyOf (the toByteArray() call in the stack
+            // trace). On a 2 GB device with only ~200 KB free this causes OOM.
+            //
+            // SoftReference allows GC to reclaim bytes under memory pressure without
+            // any explicit coordination. recycle() performs a best-effort eviction so
+            // the map stays bounded to currently-active pages.
             val cached = byteCache[key]?.get()
             if (cached != null) {
                 jpegBytes = cached
@@ -152,12 +156,9 @@ public class LiJpegTurboRegionDecoder(
         } finally {
             decoderLock.writeLock().unlock()
         }
-        // Remove from cache when page is unloaded so stale entries don't accumulate.
-        // SoftReference already allows GC collection under pressure, but explicit
-        // removal on page unload keeps the map small (one entry per loaded page).
         sourceUriKey?.let { byteCache.remove(it) }
         sourceUriKey = null
-        jpegBytes = null
+        jpegBytes    = null
     }
 
     // ── URI helpers ───────────────────────────────────────────────────────────
@@ -329,19 +330,15 @@ public class LiJpegTurboRegionDecoder(
     public companion object {
 
         /**
-         * Process-level SoftReference cache of JPEG bytes keyed by URI string.
+         * Process-level SoftReference cache: URI string → JPEG bytes.
          *
-         * reloadImage() (e.g. triggered by filter changes) creates a new
-         * [LiJpegTurboRegionDecoder] instance for the same URI. Without this cache,
-         * every init() calls readBytes() → ByteArrayOutputStream.toByteArray() which
-         * copies the buffer into a new array at exactly the file size. On a 2 GB device
-         * with only ~200 KB free this causes OOM before tiles even begin decoding.
-         *
-         * [SoftReference] lets the GC collect entries under memory pressure without
-         * requiring explicit coordination. [recycle] performs best-effort eviction
-         * when a page holder is unloaded, keeping the map bounded to active pages.
+         * Eliminates redundant disk reads when the same URI is decoded by multiple
+         * [LiJpegTurboRegionDecoder] instances (e.g. after reloadImage() creates a new
+         * decoder for an already-loaded page). SoftReference lets GC reclaim entries
+         * under memory pressure. [recycle] explicitly evicts when a page is unloaded.
          */
-        private val byteCache = java.util.concurrent.ConcurrentHashMap<String, java.lang.ref.SoftReference<ByteArray>>()
+        private val byteCache =
+            java.util.concurrent.ConcurrentHashMap<String, java.lang.ref.SoftReference<ByteArray>>()
 
         private fun isJpegMagic(bytes: ByteArray): Boolean =
             bytes.size >= 3 &&

@@ -181,15 +181,17 @@ Java_com_davemorrissey_labs_subscaleview_decoder_LiJpegTurboRegionDecoder_native
 
     // ── 6. Compute inner crop (aligned → exact sRect) in scaled-pixel space ──
     double scale = (double)sf.num / sf.denom;
-    // Use lround() for offsets: (int) truncation of the offset into the aligned buffer
-    // caused a 1-pixel row/column shift at certain tile boundaries (e.g. offset 0.5px
-    // truncated to 0 instead of rounded to 1), making adjacent tiles mis-aligned and
-    // visually blurred at seams. Dimensions keep ceil() — rounding them down would
-    // produce a bitmap 1px smaller than SSIV expects, which it then stretches → blur.
+    // Offsets use lround(): truncation via (int) cast introduces a systematic
+    // 1-pixel error at non-integer scale factors (e.g. scale=0.5, offset=3 →
+    // 1.5 truncates to 1 instead of rounding to 2). This shifts the memcpy
+    // source row/column, causing the bottom or right half of a tile to read
+    // from the wrong position in pixel_buf — visually a blurred seam between
+    // adjacent tiles at the exact point where the shift direction changes.
+    // Dimensions keep ceil() so the bitmap is never smaller than SSIV expects.
     int inner_x = (int)lround((sRect_left - aligned_left) * scale);
     int inner_y = (int)lround((sRect_top  - aligned_top)  * scale);
-    int inner_w = (int)ceil((sRect_right  - sRect_left) * scale);
-    int inner_h = (int)ceil((sRect_bottom - sRect_top)  * scale);
+    int inner_w = (int)ceil((sRect_right  - sRect_left)   * scale);
+    int inner_h = (int)ceil((sRect_bottom - sRect_top)    * scale);
     // Clamp to decoded buffer bounds.
     if (inner_x < 0) inner_x = 0;
     if (inner_y < 0) inner_y = 0;
