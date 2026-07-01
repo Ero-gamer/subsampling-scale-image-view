@@ -42,7 +42,17 @@ public class FilteringRegionDecoder(
     @WorkerThread
     override fun decodeRegion(sRect: Rect, sampleSize: Int): Bitmap {
         val tile = inner.decodeRegion(sRect, sampleSize)
-        return applyFilters(tile)
+        // Defensive: any unexpected failure in the filter math (OOM on getPixels/setPixels
+        // arrays, unsupported bitmap state, etc) must not throw out of decodeRegion — SSIV
+        // swallows such throws into a no-op onTileLoadError and never retries, permanently
+        // leaving that region unfilled/unfiltered. Falling back to the already-decoded,
+        // unfiltered tile keeps the page readable and self-corrects the moment filters
+        // legitimately apply again (next reload), instead of a silent permanent failure.
+        return try {
+            applyFilters(tile)
+        } catch (e: Throwable) {
+            tile
+        }
     }
 
     override val isReady: Boolean
@@ -61,8 +71,28 @@ public class FilteringRegionDecoder(
         val h = tile.height
         if (w <= 0 || h <= 0) return tile
 
+        // BUG FIX (silent-unfiltered-image): Bitmap.copy() is a platform type that CAN
+        // return null (allocation failure, unsupported config conversion for a malformed/
+        // atypical source image, etc). The old code force-recycled the original tile and
+        // then used the (possibly null) copy as non-null, throwing an NPE from inside
+        // decodeRegion(). SSIV's tile-load coroutine swallows that into onTileLoadError()
+        // (a no-op by default) and never retries — the tile just never loads, leaving
+        // whichever unfiltered fallback bitmap (SkiaImageDecoder base layer / preview) is
+        // underneath permanently visible for that region. If it hits every tile of one
+        // specific image (deterministic per-file), that whole page reads as "filters did
+        // nothing" forever, surviving restarts and filter-setting changes since it's a
+        // property of that file, not app state.
+        // Fix: only recycle the original after confirming the copy succeeded; on failure,
+        // fall back to returning the original tile unfiltered (still visible) rather than
+        // throwing and blacking out the tile load entirely.
         val working = if (tile.config != Bitmap.Config.ARGB_8888 || !tile.isMutable) {
-            tile.copy(Bitmap.Config.ARGB_8888, true).also { tile.recycle() }
+            val copy = tile.copy(Bitmap.Config.ARGB_8888, true)
+            if (copy != null) {
+                tile.recycle()
+                copy
+            } else {
+                tile
+            }
         } else {
             tile
         }
