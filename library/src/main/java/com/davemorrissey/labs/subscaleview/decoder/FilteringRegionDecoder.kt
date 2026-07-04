@@ -7,27 +7,26 @@ import android.graphics.Rect
 import android.net.Uri
 import androidx.annotation.WorkerThread
 import com.davemorrissey.labs.subscaleview.ImageSource
+import kotlin.math.abs
+import kotlin.random.Random
 
 /**
- * [ImageRegionDecoder] wrapper that applies CPU sharpening and/or vibrance to every
- * decoded tile immediately after the inner decoder returns it.
+ * [ImageRegionDecoder] wrapper that applies CPU denoise, sharpening, vibrance, dithering and
+ * grain to every decoded tile immediately after the inner decoder returns it — all in ONE
+ * getPixels -> loop -> setPixels pass (no extra buffers/allocations beyond the two pooled
+ * IntArrays already used for sharpening).
  *
- * This eliminates the previous encode-to-disk approach (where the full filtered page
- * was saved as PNG to [ProcessedPageCache] and then re-tiled by SSIV), replacing it with
- * a pure in-memory per-tile pass that:
- *   - never writes any extra file to disk
- *   - never decodes the whole image at once
- *   - works identically on 256×512px tiles as on full pages
- *   - is compatible with [LiJpegTurboRegionDecoder] as the inner decoder (JPEG tiles)
- *     and [SkiaImageRegionDecoder] / [SkiaPooledImageRegionDecoder] for all other formats
- *
- * Thread safety: [decodeRegion] may be called from multiple threads concurrently by SSIV's
- * tile-loading executor. Each call operates on its own tile [Bitmap] — no shared mutable
- * state exists between calls, so no locking is required here. The inner decoder is
- * responsible for its own locking (LiJpegTurboRegionDecoder uses a ReadWriteLock).
+ * Pipeline order per pixel: denoise -> sharpen -> vibrance -> dither+grain. Denoise always runs
+ * whenever sharpening is enabled (it exists specifically to stop the Laplacian sharpen from
+ * amplifying JPEG-block/compression noise) — there's no separate toggle for it. Dither+grain
+ * always run whenever this pass runs at all (denoise/sharpen/vibrance active), since their whole
+ * purpose is smoothing out banding this pass's own float->int rounding can introduce; they add
+ * no extra pixel reads (same neighbours already fetched for sharpen) beyond dither/grain's own
+ * tiny lookup-table add.
  *
  * The filter math is identical to [org.koitharu.kotatsu.core.ui.image.ImageFiltersTransformation]
- * (which is kept for the ColorFilterConfigActivity preview and any non-SSIV callers).
+ * (which is kept for the ColorFilterConfigActivity preview and any non-SSIV callers) — keep
+ * both in sync when changing constants here.
  */
 public class FilteringRegionDecoder(
     private val inner: ImageRegionDecoder,
@@ -71,44 +70,28 @@ public class FilteringRegionDecoder(
         val h = tile.height
         if (w <= 0 || h <= 0) return tile
 
-        // BUG FIX (silent-unfiltered-image): Bitmap.copy() is a platform type that CAN
-        // return null (allocation failure, unsupported config conversion for a malformed/
-        // atypical source image, etc). The old code force-recycled the original tile and
-        // then used the (possibly null) copy as non-null, throwing an NPE from inside
-        // decodeRegion(). SSIV's tile-load coroutine swallows that into onTileLoadError()
-        // (a no-op by default) and never retries — the tile just never loads, leaving
-        // whichever unfiltered fallback bitmap (SkiaImageDecoder base layer / preview) is
-        // underneath permanently visible for that region. If it hits every tile of one
-        // specific image (deterministic per-file), that whole page reads as "filters did
-        // nothing" forever, surviving restarts and filter-setting changes since it's a
-        // property of that file, not app state.
-        // Fix: only recycle the original after confirming the copy succeeded; on failure,
-        // fall back to returning the original tile unfiltered (still visible) rather than
-        // throwing and blacking out the tile load entirely.
-        val working = if (tile.config != Bitmap.Config.ARGB_8888 || !tile.isMutable) {
-            val copy = tile.copy(Bitmap.Config.ARGB_8888, true)
-            if (copy != null) {
-                tile.recycle()
-                copy
-            } else {
-                tile
-            }
-        } else {
-            tile
-        }
+        val needsCopy = tile.config != Bitmap.Config.ARGB_8888 || !tile.isMutable
+        // BUG FIX (silent-unfiltered-image): Bitmap.copy() is a platform type that CAN return
+        // null (allocation failure, unsupported config conversion for a malformed/atypical
+        // source image). The original never-recycle-until-success ordering below is what makes
+        // that survivable — see the second bug fix note further down for what happens if
+        // something throws mid-pass.
+        val working = if (needsCopy) tile.copy(Bitmap.Config.ARGB_8888, true) ?: tile else tile
 
         val pixelCount = w * h
         val src = srcPool.acquire(pixelCount)
         working.getPixels(src, 0, w, 0, 0, w, h)
 
         val k = if (doSharpen) kernelStrength(sharpening) else 0f
-        // Sharpening reads src while writing to out to avoid corrupting neighbour pixels mid-pass.
+        // Sharpening (and denoise, which feeds it) read src while writing to out to avoid
+        // corrupting neighbour pixels mid-pass.
         val out = if (doSharpen) outPool.acquire(pixelCount) else src
 
         for (y in 0 until h) {
             val rowStart = y * w
             val hasAbove = y > 0
             val hasBelow = y < h - 1
+            val rowNoise = DITHER_GRAIN
             for (x in 0 until w) {
                 val idx = rowStart + x
                 val px = src[idx]
@@ -121,12 +104,23 @@ public class FilteringRegionDecoder(
                     val bottom = src[idx + w]
                     val left   = src[idx - 1]
                     val right  = src[idx + 1]
-                    r = sharpenChannel((px shr 16) and 0xFF, (top shr 16) and 0xFF,
-                        (bottom shr 16) and 0xFF, (left shr 16) and 0xFF, (right shr 16) and 0xFF, k)
-                    g = sharpenChannel((px shr 8) and 0xFF, (top shr 8) and 0xFF,
-                        (bottom shr 8) and 0xFF, (left shr 8) and 0xFF, (right shr 8) and 0xFF, k)
-                    b = sharpenChannel(px and 0xFF, top and 0xFF,
-                        bottom and 0xFF, left and 0xFF, right and 0xFF, k)
+                    val tr = (top shr 16) and 0xFF;    val tg = (top shr 8) and 0xFF;    val tb = top and 0xFF
+                    val brr = (bottom shr 16) and 0xFF; val bg = (bottom shr 8) and 0xFF; val bb = bottom and 0xFF
+                    val lr = (left shr 16) and 0xFF;   val lg = (left shr 8) and 0xFF;   val lb = left and 0xFF
+                    val rr = (right shr 16) and 0xFF;  val rg = (right shr 8) and 0xFF;  val rb = right and 0xFF
+                    val cr = (px shr 16) and 0xFF; val cg = (px shr 8) and 0xFF; val cb = px and 0xFF
+
+                    // Denoise always precedes sharpen when sharpening is active: an edge-aware
+                    // (bilateral-lite) blend of center+neighbours replaces the center value fed
+                    // into the Laplacian below, so the sharpen kernel amplifies real edges
+                    // instead of amplifying JPEG-block/compression noise along with them.
+                    val dr = denoiseChannel(cr, tr, brr, lr, rr)
+                    val dg = denoiseChannel(cg, tg, bg, lg, rg)
+                    val db = denoiseChannel(cb, tb, bb, lb, rb)
+
+                    r = sharpenChannel(dr, tr, brr, lr, rr, k)
+                    g = sharpenChannel(dg, tg, bg, lg, rg, k)
+                    b = sharpenChannel(db, tb, bb, lb, rb, k)
                 } else {
                     r = (px shr 16) and 0xFF
                     g = (px shr 8) and 0xFF
@@ -143,12 +137,52 @@ public class FilteringRegionDecoder(
                     }
                 }
 
+                // Dither+grain: tiny luma-only perturbation (same delta on r/g/b, so no chroma
+                // speckle) from a precomputed table combining an 8x8 ordered-dither pattern
+                // (breaks up banding from this pass's own float->int rounding above) with light
+                // random grain. Table is indexed by in-tile position, not absolute page position
+                // — a 1px seam in the noise pattern at tile boundaries is imperceptible for
+                // noise, and avoiding absolute coordinates keeps this pass allocation-free.
+                val noise = rowNoise[((y and 63) shl 6) or (x and 63)]
+                if (noise != 0) {
+                    r = (r + noise).coerceIn(0, 255)
+                    g = (g + noise).coerceIn(0, 255)
+                    b = (b + noise).coerceIn(0, 255)
+                }
+
                 out[idx] = (px and ALPHA_MASK) or (r shl 16) or (g shl 8) or b
             }
         }
 
         working.setPixels(out, 0, w, 0, 0, w, h)
+        // BUG FIX (recycled-bitmap-on-error): recycle the ORIGINAL only now, after every step
+        // that could throw (getPixels/setPixels/OOM in the pools) has already succeeded. The
+        // previous version recycled `tile` immediately after the copy, before the pixel loop
+        // ran — if anything below it threw, decodeRegion()'s catch block returned `tile`
+        // (the same object, by reference) already recycled, which crashes the next time SSIV
+        // tries to draw it. Deferring recycle to here means the catch-all fallback always
+        // returns a live bitmap.
+        if (needsCopy && working !== tile) tile.recycle()
         return working
+    }
+
+    // ── denoise ──────────────────────────────────────────────────────────────
+
+    /**
+     * Edge-aware ("bilateral-lite") denoise for one channel: blends [center] toward its 4
+     * neighbours, weighting each neighbour DOWN the more it differs from center — this avoids
+     * blurring across real edges (which a plain box blur would do) while still smoothing flat
+     * noisy regions where neighbours are already close to center. [DENOISE_STRENGTH] caps how
+     * far center is allowed to move.
+     */
+    private fun denoiseChannel(center: Int, top: Int, bottom: Int, left: Int, right: Int): Int {
+        val wT = 1f / (1f + abs(center - top) * DENOISE_RANGE_FALLOFF)
+        val wB = 1f / (1f + abs(center - bottom) * DENOISE_RANGE_FALLOFF)
+        val wL = 1f / (1f + abs(center - left) * DENOISE_RANGE_FALLOFF)
+        val wR = 1f / (1f + abs(center - right) * DENOISE_RANGE_FALLOFF)
+        val wSum = 1f + wT + wB + wL + wR
+        val denoised = (center + top * wT + bottom * wB + left * wL + right * wR) / wSum
+        return clamp255(center + DENOISE_STRENGTH * (denoised - center))
     }
 
     // ── sharpening ───────────────────────────────────────────────────────────
@@ -241,6 +275,8 @@ public class FilteringRegionDecoder(
     private companion object {
         private const val SHARPEN_SCALAR  = 0.5f
         private const val VIBRANCE_SCALAR = 1.5f
+        private const val DENOISE_STRENGTH = 0.6f
+        private const val DENOISE_RANGE_FALLOFF = 0.15f
         private val ALPHA_MASK = 0xFF000000.toInt()
 
         // Two pools: src (always needed) and out (only when sharpening, because sharpening
@@ -259,5 +295,45 @@ public class FilteringRegionDecoder(
             set(arr)
             return arr
         }
+
+        /**
+         * 64x64 precomputed dither+grain table, generated once (deterministic seed).
+         * Combines an 8x8 ordered (Bayer) dither pattern, tiled 8x, with light random grain —
+         * see [buildDitherGrainTable]. Values are small signed ints (~ -5..+5).
+         */
+        private val DITHER_GRAIN: IntArray = buildDitherGrainTable()
+
+        private fun buildDitherGrainTable(): IntArray {
+            val bayer8 = intArrayOf(
+                0, 32, 8, 40, 2, 34, 10, 42,
+                48, 16, 56, 24, 50, 18, 58, 26,
+                12, 44, 4, 36, 14, 46, 6, 38,
+                60, 28, 52, 20, 62, 30, 54, 22,
+                3, 35, 11, 43, 1, 33, 9, 41,
+                51, 19, 59, 27, 49, 17, 57, 25,
+                15, 47, 7, 39, 13, 45, 5, 37,
+                63, 31, 55, 23, 61, 29, 53, 21,
+            )
+            val random = Random(0xC0FFEE)
+            val table = IntArray(64 * 64)
+            for (y in 0 until 64) {
+                for (x in 0 until 64) {
+                    val bayerValue = bayer8[(y % 8) * 8 + (x % 8)] // 0..63
+                    val ditherBias = (bayerValue / 63f - 0.5f) * DITHER_AMPLITUDE
+                    val grainBias = (random.nextFloat() - 0.5f) * GRAIN_AMPLITUDE
+                    table[y * 64 + x] = (ditherBias + grainBias).let {
+                        when {
+                            it <= -8f -> -8
+                            it >= 8f  -> 8
+                            else      -> Math.round(it)
+                        }
+                    }
+                }
+            }
+            return table
+        }
+
+        private const val DITHER_AMPLITUDE = 3f
+        private const val GRAIN_AMPLITUDE = 5f
     }
 }
