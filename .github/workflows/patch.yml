@@ -1,0 +1,42 @@
+name: Auto Apply Patch
+
+on:
+  push:
+    paths:
+      - '**.patch'
+  workflow_dispatch:
+
+jobs:
+  apply:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout Repository
+        uses: actions/checkout@v7
+        with:
+          submodules: 'recursive'
+          # Set fetch-depth to 0 to allow clean pushes back to the branch
+          fetch-depth: 0
+
+      - name: Apply and Commit Claude Patch
+        run: |
+          # Find any .patch files in the root directory
+          PATCH_FILES=$(ls *.patch 2>/dev/null || true)
+          
+          if [ -n "$PATCH_FILES" ]; then
+            # Configure git author credentials for the automated commit
+            git config --global user.name "github-actions[bot]"
+            git config --global user.email "41898282+github-actions[bot]@users.noreply.github.com"
+            
+            for patch in $PATCH_FILES; do
+              echo "Found patch file: $patch. Applying changes..."
+              git apply "$patch"
+              rm "$patch"
+            done
+            
+            # Commit the modified source code and push it back to the repository
+            git add .
+            git commit -m "Automated patch application from Claude development pipeline"
+            git push origin ${{ github.ref_name }}
+          else
+            echo "No .patch files found."
+          fi
