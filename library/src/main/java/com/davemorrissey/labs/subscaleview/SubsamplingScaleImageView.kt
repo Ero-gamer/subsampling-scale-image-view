@@ -528,6 +528,20 @@ public open class SubsamplingScaleImageView @JvmOverloads constructor(
 		}
 	}
 
+	/**
+	 * Sets the maximum tile size in pixels. Smaller tiles reduce peak memory at the cost of
+	 * more decode calls while panning. Use [TILE_SIZE_AUTO] to let SSIV use the canvas maximum.
+	 * Safe to call before or after image load — triggers a reset+redraw if already ready.
+	 */
+	public fun setMaxTileSize(maxWidth: Int, maxHeight: Int) {
+		this.maxTileWidth = maxWidth
+		this.maxTileHeight = maxHeight
+		if (isReady) {
+			reset(false)
+			invalidate()
+		}
+	}
+
 	public fun setDoubleTapZoomDpi(dpi: Int) {
 		val metrics = resources.displayMetrics
 		val averageDpi = (metrics.xdpi + metrics.ydpi) / 2
