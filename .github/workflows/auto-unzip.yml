@@ -44,7 +44,7 @@ jobs:
               print("COMMIT_MSG=Auto-extract: GEMINI_API_KEY secret is missing")
               exit(0)
 
-          # Get file status and detailed diff
+          # Get status and detailed diff
           diff_stat = subprocess.getoutput("git status --short")
           diff_patch = subprocess.getoutput("git diff --cached --stat -p | head -n 100")
 
@@ -61,18 +61,28 @@ jobs:
               f"Diff Snippet:\n{diff_patch}"
           )
 
-          # Stable Gemini 2.5 Flash endpoint
-          url = f"https://generativelanguage.googleapis.com/v1beta/models/gemini-3.8-flash:generateContent?key={api_key}"
-          payload = json.dumps({"contents": [{"parts": [{"text": prompt}]}]}).encode("utf-8")
-          headers = {"Content-Type": "application/json"}
+          # Primary Flash models with fallback order
+          models = ["gemini-3.5-flash", "gemini-3.5-flash-lite", "gemini-2.5-flash", "gemini-2.5-flash-lite", "gemini-1.5-flash"]
+          msg = None
 
-          try:
-              req = urllib.request.Request(url, data=payload, headers=headers)
-              with urllib.request.urlopen(req) as response:
-                  res_data = json.loads(response.read().decode("utf-8"))
-                  msg = res_data["candidates"][0]["content"]["parts"][0]["text"].strip()
-          except Exception as e:
-              msg = f"Auto-extract: Updated files from archive (API Error: {e})"
+          for model in models:
+              url = f"https://generativelanguage.googleapis.com/v1beta/models/{model}:generateContent?key={api_key}"
+              payload = json.dumps({"contents": [{"parts": [{"text": prompt}]}]}).encode("utf-8")
+              headers = {"Content-Type": "application/json"}
+
+              try:
+                  req = urllib.request.Request(url, data=payload, headers=headers)
+                  with urllib.request.urlopen(req) as response:
+                      res_data = json.loads(response.read().decode("utf-8"))
+                      msg = res_data["candidates"][0]["content"]["parts"][0]["text"].strip()
+                      if msg:
+                          break
+              except Exception as e:
+                  print(f"Model {model} failed ({e}), trying next fallback...")
+                  continue
+
+          if not msg:
+              msg = "Auto-extract: Code files updated from archive (API Unavailable)"
 
           # Save to multiline environment variable for GitHub Actions
           with open(os.environ["GITHUB_ENV"], "a") as f:
