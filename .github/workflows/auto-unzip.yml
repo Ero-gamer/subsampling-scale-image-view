@@ -10,6 +10,7 @@ jobs:
     runs-on: ubuntu-latest
     permissions:
       contents: write # Needed to commit the extracted files
+
     steps:
       - name: Checkout code
         uses: actions/checkout@v7
@@ -19,22 +20,61 @@ jobs:
           # Find the zip file
           ZIP_FILE=$(find . -maxdepth 1 -name "*.zip" | head -n 1)
           
-          # Unzip it, overwriting existing files
-          unzip -o "$ZIP_FILE" -d .
+          if [ -n "$ZIP_FILE" ]; then
+            # Unzip, overwriting existing files
+            unzip -o "$ZIP_FILE" -d .
+            # Remove the zip file after extraction
+            rm "$ZIP_FILE"
+          fi
+
+      - name: Stage Changes
+        run: |
+          git add .
+
+      - name: Generate AI Commit Message
+        id: ai_summary
+        env:
+          GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
+        run: |
+          # Get modified/added file names and code changes (truncated to prevent payload limit)
+          DIFF_SUMMARY=$(git diff --cached --stat | head -n 40)
           
-          # Remove the zip file after extraction
-          rm "$ZIP_FILE"
+          if [ -z "$DIFF_SUMMARY" ]; then
+            echo "COMMIT_MSG=Auto-extract: No changes detected" >> $GITHUB_ENV
+            exit 0
+          fi
+
+          # Prepare prompt for Gemini
+          PROMPT="Analyze the following git diff summary and generate a concise commit message (Max 1 line title, followed by a bulleted summary of 2-3 key changes). Do not include markdown blocks or extra commentary. Diff:\n$DIFF_SUMMARY"
+
+          # Call Gemini API
+          RESPONSE=$(curl -s -X POST "https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash:generateContent?key=${GEMINI_API_KEY}" \
+            -H "Content-Type: application/json" \
+            -d "{\"contents\": [{\"parts\": [{\"text\": $(echo "$PROMPT" | jq -R -s .)}]}]}")
+
+          # Extract text from API response
+          AI_MSG=$(echo "$RESPONSE" | jq -r '.candidates[0].content.parts[0].text' | tr -d '\r')
+
+          if [ -z "$AI_MSG" ] || [ "$AI_MSG" == "null" ]; then
+            AI_MSG="Auto-extract: Code files updated from zip archive"
+          fi
+
+          # Save to multiline environment variable
+          {
+            echo "COMMIT_MSG<<EOF"
+            echo "$AI_MSG"
+            echo "EOF"
+          } >> $GITHUB_ENV
 
       - name: Commit and Push
         run: |
           git config --global user.name "github-actions[bot]"
           git config --global user.email "github-actions[bot]@users.noreply.github.com"
           
-          # Stage all extracted files
-          git add .
-          
-          # Commit the changes
-          git commit -m "Auto-extract: Decompressed $(basename "$ZIP_FILE")"
-          
-          # Push to the current branch
-          git push
+          # Check if there are changes to commit
+          if ! git diff --cached --quiet; then
+            git commit -m "$COMMIT_MSG"
+            git push
+          else
+            echo "No changes to commit."
+          fi
