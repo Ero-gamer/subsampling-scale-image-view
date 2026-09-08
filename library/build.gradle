@@ -5,26 +5,23 @@ plugins {
     id 'maven-publish'
 }
 
-group = 'com.github.Ero-gamer'
+group = 'com.davemorrissey.labs'
+archivesBaseName = 'subsampling-scale-image-view-androidx'
 version = '4.3.1'
-
-base {
-    archivesName = 'subsampling-scale-image-view-androidx'
-}
 
 android {
     compileSdk = 35
     namespace = 'com.davemorrissey.labs.subscaleview'
     
+    // This must be INSIDE the android block
+    publishing {
+        singleVariant("release")
+    }
+	
     defaultConfig {
         minSdk = 23
         targetSdk = 35
         consumerProguardFiles 'proguard-rules.txt'
-        externalNativeBuild {
-            cmake {
-                abiFilters "arm64-v8a", "armeabi-v7a", "x86_64"
-            }
-        }
     }
 
     compileOptions {
@@ -51,12 +48,17 @@ android {
         }
     }
 
-    publishing {
-        singleVariant("release") {
-            withSourcesJar()
+    defaultConfig {
+        externalNativeBuild {
+            cmake {
+                // arm64-v8a: modern 64-bit Android (NEON SIMD enabled)
+                // armeabi-v7a: 32-bit ARM fallback
+                // x86_64: emulator support
+                abiFilters "arm64-v8a", "armeabi-v7a", "x86_64"
+            }
         }
     }
-}
+} // This brace correctly closes the android block
 
 configurations {
     javadocs
@@ -65,23 +67,28 @@ configurations {
 dependencies {
     implementation 'org.jetbrains.kotlin:kotlin-stdlib:2.3.20'
     implementation "androidx.customview:customview:1.2.0"
+    javadocs 'androidx.annotation:annotation:1.10.0'
+    javadocs 'androidx.exifinterface:exifinterface:1.4.2'
     implementation 'androidx.annotation:annotation:1.10.0'
     implementation 'androidx.exifinterface:exifinterface:1.4.2'
     implementation 'androidx.lifecycle:lifecycle-runtime-ktx:2.10.0'
     implementation 'org.jetbrains.kotlinx:kotlinx-coroutines-android:1.11.0'
 }
 
-publishing {
-    publications {
-        release(MavenPublication) {
-            from components.release
-            groupId = 'com.github.Ero-gamer'
-            artifactId = 'subsampling-scale-image-view-androidx'
-            version = '4.3.1'
+afterEvaluate {
+    publishing {
+        publications {
+            release(MavenPublication) {
+                from components.release
+                groupId = 'com.github.Ero-gamer'
+                artifactId = 'subsampling-scale-image-view-androidx'
+                version = '4.3.1'
+            }
         }
     }
 }
 
+// Cleaned up Javadoc task to prevent "Unexpected input" errors
 task javadoc(type: Javadoc) {
     failOnError false
     source = android.sourceSets.main.java.sourceFiles
