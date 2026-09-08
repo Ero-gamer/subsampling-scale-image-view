@@ -5,28 +5,23 @@ plugins {
     id 'maven-publish'
 }
 
-group = 'com.davemorrissey.labs'
-archivesBaseName = 'subsampling-scale-image-view-androidx'
+group = 'com.github.Ero-gamer'
 version = '4.3.1'
+
+base {
+    archivesName = 'subsampling-scale-image-view-androidx'
+}
 
 android {
     compileSdk = 35
     namespace = 'com.davemorrissey.labs.subscaleview'
     
-    // This must be INSIDE the android block
-    publishing {
-        singleVariant("release")
-    }
-	
     defaultConfig {
         minSdk = 23
         targetSdk = 35
         consumerProguardFiles 'proguard-rules.txt'
         externalNativeBuild {
             cmake {
-                // arm64-v8a: modern 64-bit Android (NEON SIMD enabled)
-                // armeabi-v7a: 32-bit ARM fallback
-                // x86_64: emulator support
                 abiFilters "arm64-v8a", "armeabi-v7a", "x86_64"
             }
         }
@@ -56,7 +51,12 @@ android {
         }
     }
 
-} // This brace correctly closes the android block
+    publishing {
+        singleVariant("release") {
+            withSourcesJar()
+        }
+    }
+}
 
 configurations {
     javadocs
@@ -71,20 +71,17 @@ dependencies {
     implementation 'org.jetbrains.kotlinx:kotlinx-coroutines-android:1.11.0'
 }
 
-afterEvaluate {
-    publishing {
-        publications {
-            release(MavenPublication) {
-                from components.release
-                groupId = 'com.github.Ero-gamer'
-                artifactId = 'subsampling-scale-image-view-androidx'
-                version = '4.3.1'
-            }
+publishing {
+    publications {
+        release(MavenPublication) {
+            from components.release
+            groupId = 'com.github.Ero-gamer'
+            artifactId = 'subsampling-scale-image-view-androidx'
+            version = '4.3.1'
         }
     }
 }
 
-// Cleaned up Javadoc task to prevent "Unexpected input" errors
 task javadoc(type: Javadoc) {
     failOnError false
     source = android.sourceSets.main.java.sourceFiles
