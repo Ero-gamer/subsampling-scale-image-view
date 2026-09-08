@@ -44,18 +44,20 @@ jobs:
               print("COMMIT_MSG=Auto-extract: GEMINI_API_KEY secret is missing")
               exit(0)
 
-          # Get status and detailed diff
-          diff_stat = subprocess.getoutput("git status --short")
-          diff_patch = subprocess.getoutput("git diff --cached --stat -p | head -n 100")
+          # Get status and detailed diff while explicitly ignoring .zip archive deletions
+          diff_stat = subprocess.getoutput("git status --short -- . \":(exclude)*.zip\"")
+          diff_patch = subprocess.getoutput("git diff --cached --stat -p -- . \":(exclude)*.zip\" | head -n 150")
 
           if not diff_stat.strip():
-              print("COMMIT_MSG=Auto-extract: No changes detected")
+              print("COMMIT_MSG=Auto-extract: Code files updated from zip archive")
               exit(0)
 
           prompt = (
-              "Analyze the following git changes from an extracted zip archive. "
-              "Provide a single concise commit title (max 50 chars), followed by 2-3 bullet points "
-              "summarizing key additions or modifications across the source files. "
+              "Analyze the following git changes extracted from a zip archive. "
+              "Provide a concise commit title (max 50 characters) summarizing the primary changes, "
+              "followed by detailed bullet points describing important additions, refactors, or modifications across the source code files. "
+              "Focus strictly on actual code changes and technical implementation details. "
+              "Do NOT mention, summarize, or note the removal or deletion of any .zip archive file. "
               "Do not use markdown code blocks.\n\n"
               f"Changed Files Summary:\n{diff_stat}\n\n"
               f"Diff Snippet:\n{diff_patch}"
