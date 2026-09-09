@@ -245,32 +245,23 @@ public class GpuTileRenderer(private val context: Context) {
         GLES30.glDrawArrays(GLES30.GL_TRIANGLE_STRIP, 0, 4)
         GLES30.glBindVertexArray(0)
 
-        // Read back — glReadPixels returns bottom-up RGBA rows; flip to top-down.
+        // Read back. The quad's texcoord mapping (NDC y=-1 -> v=0) combined with
+        // GLUtils.texImage2D's top-down bitmap upload renders the tile flipped once into
+        // the framebuffer; glReadPixels' bottom-up readback convention exactly cancels
+        // that flip. The result is that this buffer is ALREADY in correct top-down row
+        // order for Bitmap.copyPixelsFromBuffer — do not flip it again (a previous
+        // version of this code did, which produced upside-down tiles).
         val totalBytes = w * h * 4
         val pixelBuf   = ByteBuffer.allocateDirect(totalBytes).order(ByteOrder.nativeOrder())
         GLES30.glReadPixels(0, 0, w, h, GLES30.GL_RGBA, GLES30.GL_UNSIGNED_BYTE, pixelBuf)
         pixelBuf.position(0)
 
-        val flipped = flipVertically(pixelBuf, w, h)
-        val result  = Bitmap.createBitmap(w, h, Bitmap.Config.ARGB_8888)
-        result.copyPixelsFromBuffer(flipped)
+        val result = Bitmap.createBitmap(w, h, Bitmap.Config.ARGB_8888)
+        result.copyPixelsFromBuffer(pixelBuf)
 
         GLES30.glDeleteTextures(1, texIds, 0)
         releaseCurrent()
         return result
-    }
-
-    private fun flipVertically(src: ByteBuffer, w: Int, h: Int): ByteBuffer {
-        val rowBytes = w * 4
-        val out      = ByteBuffer.allocateDirect(w * h * 4).order(ByteOrder.nativeOrder())
-        val row      = ByteArray(rowBytes)
-        for (y in 0 until h) {
-            src.position((h - 1 - y) * rowBytes)
-            src.get(row)
-            out.put(row)
-        }
-        out.position(0)
-        return out
     }
 
     // ── EGL helpers ───────────────────────────────────────────────────────────
