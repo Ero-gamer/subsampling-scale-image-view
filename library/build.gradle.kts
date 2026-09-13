@@ -66,7 +66,7 @@ android {
 val javadocs by configurations.creating
 
 dependencies {
-    implementation("org.jetbrains.kotlin:kotlin-stdlib:2.3.20")
+    implementation("org.jetbrains.kotlin:kotlin-stdlib:2.4.20")
     implementation("androidx.customview:customview:1.2.0")
     javadocs("androidx.annotation:annotation:1.10.0")
     javadocs("androidx.exifinterface:exifinterface:1.4.2")
