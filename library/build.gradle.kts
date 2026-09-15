@@ -105,9 +105,13 @@ afterEvaluate {
 // Cleaned up Javadoc task to prevent "Unexpected input" errors
 tasks.register<Javadoc>("javadoc") {
     isFailOnError = false
-    // AndroidSourceDirectorySet.java already IS a FileTree (it implements SourceDirectorySet,
-    // which extends FileTree) — `.sourceFiles` was never a valid member here and is the root
-    // cause of this build's failure ("Unresolved reference: sourceFiles").
-    source = android.sourceSets.getByName("main").java
+    // android.sourceSets["main"].java is AGP's AndroidSourceDirectorySet, which is NOT a
+    // Gradle FileTree in this AGP version's API surface (assigning it directly fails with
+    // "Type mismatch: inferred type is AndroidSourceDirectorySet but FileTree! was expected"),
+    // and it does not expose a `.sourceFiles` member either (the original script's error:
+    // "Unresolved reference: sourceFiles"). `srcDirs` (a Set<File>) is the one member present
+    // on every AndroidSourceDirectorySet variant across AGP versions, so build the FileTree
+    // from that explicitly instead of relying on either interface's extra members.
+    source = files(android.sourceSets.getByName("main").java.srcDirs).asFileTree
     classpath += project.files(android.bootClasspath.joinToString(File.pathSeparator))
 }
