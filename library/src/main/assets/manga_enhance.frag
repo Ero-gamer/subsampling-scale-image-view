@@ -12,6 +12,8 @@ uniform bool  u_enableDarken;      // Anime4K Line Darken
 uniform bool  u_enableVibrance;    // Vibrance / S-Curve
 uniform int   u_sharpenMode;       // 0=Off  1=RCAS+USM  2=Adaptive
 uniform float u_sharpness;         // 0.0..1.0
+uniform float u_denoiseStrength;   // 0.0..1.0 — drives the bilateral falloff constant
+uniform float u_vibranceIntensity; // 0.0..1.0 — magnitude of the vibrance boost
 
 float getLuma(vec3 c) {
     return dot(c, vec3(0.299, 0.587, 0.114));
@@ -39,16 +41,20 @@ void main() {
         float wSum = 1.0;
 
         // Unrolled loop — avoids dynamic indexing on PowerVR
+        // Falloff constant: strength 0.0 -> 20.0 (mild, edge-preserving),
+        // strength 1.0 -> 4.0 (aggressive smoothing). Smaller constant = weight
+        // stays higher across larger luma deltas = more blending = stronger denoise.
+        float falloff = mix(20.0, 4.0, clamp(u_denoiseStrength, 0.0, 1.0));
         float d; float w;
 
-        d = abs(getLuma(c1) - l5); w = exp(-d * 12.0); accum += c1 * w; wSum += w;
-        d = abs(getLuma(c2) - l5); w = exp(-d * 12.0); accum += c2 * w; wSum += w;
-        d = abs(getLuma(c3) - l5); w = exp(-d * 12.0); accum += c3 * w; wSum += w;
-        d = abs(getLuma(c4) - l5); w = exp(-d * 12.0); accum += c4 * w; wSum += w;
-        d = abs(getLuma(c6) - l5); w = exp(-d * 12.0); accum += c6 * w; wSum += w;
-        d = abs(getLuma(c7) - l5); w = exp(-d * 12.0); accum += c7 * w; wSum += w;
-        d = abs(getLuma(c8) - l5); w = exp(-d * 12.0); accum += c8 * w; wSum += w;
-        d = abs(getLuma(c9) - l5); w = exp(-d * 12.0); accum += c9 * w; wSum += w;
+        d = abs(getLuma(c1) - l5); w = exp(-d * falloff); accum += c1 * w; wSum += w;
+        d = abs(getLuma(c2) - l5); w = exp(-d * falloff); accum += c2 * w; wSum += w;
+        d = abs(getLuma(c3) - l5); w = exp(-d * falloff); accum += c3 * w; wSum += w;
+        d = abs(getLuma(c4) - l5); w = exp(-d * falloff); accum += c4 * w; wSum += w;
+        d = abs(getLuma(c6) - l5); w = exp(-d * falloff); accum += c6 * w; wSum += w;
+        d = abs(getLuma(c7) - l5); w = exp(-d * falloff); accum += c7 * w; wSum += w;
+        d = abs(getLuma(c8) - l5); w = exp(-d * falloff); accum += c8 * w; wSum += w;
+        d = abs(getLuma(c9) - l5); w = exp(-d * falloff); accum += c9 * w; wSum += w;
 
         color = accum / wSum;
     }
@@ -88,15 +94,20 @@ void main() {
 
     // ── 5. Vibrance / S-Curve ────────────────────────────────────────────────
     if (u_enableVibrance) {
+        vec3 base = color;
         // Smooth S-curve contrast
-        color = color * color * (3.0 - 2.0 * color);
+        vec3 curved = base * base * (3.0 - 2.0 * base);
         // Selective vibrance (boosts muted colours only)
-        float maxC = max(color.r, max(color.g, color.b));
-        float minC = min(color.r, min(color.g, color.b));
+        float maxC = max(curved.r, max(curved.g, curved.b));
+        float minC = min(curved.r, min(curved.g, curved.b));
         float sat  = maxC - minC;
-        float luma = getLuma(color);
+        float luma = getLuma(curved);
         float vibrAmt = 0.25 * (1.0 - sat);
-        color = mix(vec3(luma), color, 1.0 + vibrAmt);
+        vec3 boosted = mix(vec3(luma), curved, 1.0 + vibrAmt);
+        // u_vibranceIntensity blends the whole effect back toward the untouched
+        // source colour, giving the slider a real, continuous magnitude instead
+        // of a bare on/off switch.
+        color = mix(base, boosted, clamp(u_vibranceIntensity, 0.0, 1.0));
     }
 
     fragColor = vec4(color, 1.0);

@@ -16,11 +16,12 @@ import androidx.annotation.WorkerThread
  * **What this does NOT replace:** Brightness, Contrast, and Saturation remain as CPU/Canvas
  * `ColorMatrix` paint filters on SSIV — they are cheap, allocation-free, and zero latency.
  *
- * **Shader controls** (set via the GPU API extension functions or [ReaderSettings]):
- * - Denoise  → bilateral spatial filter
+ * **Shader controls** (set via [Factory]'s constructor — the app's `ReaderSettings.applyBitmapConfig()`
+ * is the single call-site that constructs this):
+ * - Denoise  → bilateral spatial filter, intensity via `denoiseStrength`
  * - Darken   → Anime4K-style line darkening
- * - Vibrance → S-curve + selective chroma boost
- * - Sharpen  → RCAS+USM (mode 1) or Adaptive (mode 2) at given intensity
+ * - Vibrance → S-curve + selective chroma boost, intensity via `vibranceIntensity`
+ * - Sharpen  → RCAS+USM (mode 1) or Adaptive (mode 2) at given `sharpness` intensity
  *
  * If the GPU renderer fails to initialise (unsupported driver, OOM), tile decoding falls back
  * to returning the unfiltered bitmap — the image remains fully readable.
@@ -68,10 +69,12 @@ public class GpuFilteringDecoder(
         enableVibrance: Boolean = false,
         sharpenMode: Int        = 0,
         sharpness: Float        = 0f,
+        denoiseStrength: Float   = 0.5f,
+        vibranceIntensity: Float = 1f,
         // The renderer is shared across all decoder instances produced by this factory so the
         // EGL context is created once per SSIV image load, not once per tile decode worker.
         // Public (not internal): app code in a separate module reads/reuses this renderer
-        // (see ReaderSettings.applyBitmapConfig and GpuFilterExt.applyGpuFactory).
+        // (see ReaderSettings.applyBitmapConfig).
         public val renderer: GpuTileRenderer,
     ) : DecoderFactory<GpuFilteringDecoder> {
 
@@ -81,6 +84,8 @@ public class GpuFilteringDecoder(
             renderer.enableVibrance = enableVibrance
             renderer.sharpenMode    = sharpenMode
             renderer.sharpness      = sharpness
+            renderer.denoiseStrength   = denoiseStrength
+            renderer.vibranceIntensity = vibranceIntensity
         }
 
         override val bitmapConfig: Bitmap.Config? get() = innerFactory.bitmapConfig
@@ -88,11 +93,13 @@ public class GpuFilteringDecoder(
         override fun make(): GpuFilteringDecoder =
             GpuFilteringDecoder(innerFactory.make(), renderer)
 
-        /** Expose renderer state for equality checks in applyBitmapConfig / applyGpuFactory. */
+        /** Expose renderer state for equality checks in applyBitmapConfig. */
         val enableDenoise:  Boolean get() = renderer.enableDenoise
         val enableDarken:   Boolean get() = renderer.enableDarken
         val enableVibrance: Boolean get() = renderer.enableVibrance
         val sharpenMode:    Int     get() = renderer.sharpenMode
         val sharpness:      Float   get() = renderer.sharpness
+        val denoiseStrength:   Float get() = renderer.denoiseStrength
+        val vibranceIntensity: Float get() = renderer.vibranceIntensity
     }
 }

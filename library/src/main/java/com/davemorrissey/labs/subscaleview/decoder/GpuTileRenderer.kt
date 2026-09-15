@@ -61,12 +61,18 @@ public class GpuTileRenderer(private val context: Context) {
     private var uVibrance   = -1
     private var uSharpenMode = -1
     private var uSharpness  = -1
+    private var uDenoiseStrength   = -1
+    private var uVibranceIntensity = -1
 
     @Volatile var enableDenoise  = false
     @Volatile var enableDarken   = false
     @Volatile var enableVibrance = false
     @Volatile var sharpenMode    = 0
     @Volatile var sharpness      = 0f
+    /** Bilateral falloff intensity, 0.0 (mild) .. 1.0 (aggressive). Only used when [enableDenoise]. */
+    @Volatile var denoiseStrength   = 0.5f
+    /** Vibrance boost magnitude, 0.0 (no-op) .. 1.0 (full). Only used when [enableVibrance]. */
+    @Volatile var vibranceIntensity = 1f
 
     private var ready = false
 
@@ -124,6 +130,8 @@ public class GpuTileRenderer(private val context: Context) {
             uVibrance    = GLES30.glGetUniformLocation(program, "u_enableVibrance")
             uSharpenMode = GLES30.glGetUniformLocation(program, "u_sharpenMode")
             uSharpness   = GLES30.glGetUniformLocation(program, "u_sharpness")
+            uDenoiseStrength   = GLES30.glGetUniformLocation(program, "u_denoiseStrength")
+            uVibranceIntensity = GLES30.glGetUniformLocation(program, "u_vibranceIntensity")
 
             releaseCurrent()
             ready = true
@@ -241,6 +249,8 @@ public class GpuTileRenderer(private val context: Context) {
         GLES30.glUniform1i(uVibrance,    if (enableVibrance) 1 else 0)
         GLES30.glUniform1i(uSharpenMode, sharpenMode)
         GLES30.glUniform1f(uSharpness,   sharpness)
+        GLES30.glUniform1f(uDenoiseStrength,   denoiseStrength)
+        GLES30.glUniform1f(uVibranceIntensity, vibranceIntensity)
         GLES30.glBindVertexArray(quadVao)
         GLES30.glDrawArrays(GLES30.GL_TRIANGLE_STRIP, 0, 4)
         GLES30.glBindVertexArray(0)
