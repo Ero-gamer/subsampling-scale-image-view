@@ -23,6 +23,6 @@ buildscript {
         // Bumped 2.2.10 -> 2.3.20 to match the kotlin-stdlib version already declared in
         // library/build.gradle.kts (they were out of sync) and is within Kotlin 2.3.0's
         // documented AGP 8.13.0 compatibility ceiling.
-        classpath("org.jetbrains.kotlin:kotlin-gradle-plugin:2.3.20")
+        classpath("org.jetbrains.kotlin:kotlin-gradle-plugin:2.4.20")
     }
 }
