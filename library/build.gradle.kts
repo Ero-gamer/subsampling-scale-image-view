@@ -1,3 +1,5 @@
+import org.jetbrains.kotlin.gradle.dsl.JvmTarget
+
 plugins {
     id("com.android.library")
     id("kotlin-android")
@@ -23,18 +25,21 @@ android {
 
     defaultConfig {
         minSdk = 23
-        targetSdk = 35
         consumerProguardFiles("proguard-rules.txt")
+    }
+
+    // targetSdk on defaultConfig is deprecated for library modules (removed in AGP 9.0) —
+    // it only ever affected the test APK and lint's target, so those are now set explicitly.
+    testOptions {
+        targetSdk = 35
+    }
+    lint {
+        targetSdk = 35
     }
 
     compileOptions {
         sourceCompatibility = JavaVersion.VERSION_17
         targetCompatibility = JavaVersion.VERSION_17
-    }
-
-    kotlinOptions {
-        jvmTarget = JavaVersion.VERSION_17.toString()
-        freeCompilerArgs += "-Xexplicit-api=warning"
     }
 
     buildTypes {
@@ -63,6 +68,14 @@ android {
     }
 } // This brace correctly closes the android block
 
+// kotlinOptions{} is deprecated (removed in AGP 9.0) — migrated to the compilerOptions DSL.
+kotlin {
+    compilerOptions {
+        jvmTarget.set(JvmTarget.JVM_17)
+        freeCompilerArgs.add("-Xexplicit-api=warning")
+    }
+}
+
 val javadocs by configurations.creating
 
 dependencies {
@@ -72,7 +85,7 @@ dependencies {
     javadocs("androidx.exifinterface:exifinterface:1.4.2")
     implementation("androidx.annotation:annotation:1.10.0")
     implementation("androidx.exifinterface:exifinterface:1.4.2")
-    implementation("androidx.lifecycle:lifecycle-runtime-ktx:2.10.0")
+    implementation("androidx.lifecycle:lifecycle-runtime-ktx:2.11.0")
     implementation("org.jetbrains.kotlinx:kotlinx-coroutines-android:1.11.0")
 }
 
@@ -92,6 +105,9 @@ afterEvaluate {
 // Cleaned up Javadoc task to prevent "Unexpected input" errors
 tasks.register<Javadoc>("javadoc") {
     isFailOnError = false
-    source = android.sourceSets.getByName("main").java.sourceFiles
+    // AndroidSourceDirectorySet.java already IS a FileTree (it implements SourceDirectorySet,
+    // which extends FileTree) — `.sourceFiles` was never a valid member here and is the root
+    // cause of this build's failure ("Unresolved reference: sourceFiles").
+    source = android.sourceSets.getByName("main").java
     classpath += project.files(android.bootClasspath.joinToString(File.pathSeparator))
 }
