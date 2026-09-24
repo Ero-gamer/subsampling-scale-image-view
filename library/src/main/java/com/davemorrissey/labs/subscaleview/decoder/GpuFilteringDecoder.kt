@@ -17,11 +17,15 @@ import androidx.annotation.WorkerThread
  * `ColorMatrix` paint filters on SSIV — they are cheap, allocation-free, and zero latency.
  *
  * **Shader controls** (set via [Factory]'s constructor — the app's `ReaderSettings.applyBitmapConfig()`
- * is the single call-site that constructs this):
- * - Denoise  → bilateral spatial filter, intensity via `denoiseStrength`
- * - Darken   → Anime4K-style line darkening
- * - Vibrance → S-curve + selective chroma boost, intensity via `vibranceIntensity`
- * - Sharpen  → RCAS+USM (mode 1) or Adaptive (mode 2) at given `sharpness` intensity
+ * is the single call-site that constructs this). Every filter is an independent
+ * (enable, intensity) pair; they stack and none excludes another. (Bicubic *scalers* are not
+ * decode-time filters — see [com.davemorrissey.labs.subscaleview.ImageScaler].)
+ * - Denoise             → 3x3 luma-weighted denoise (range-only, not a true bilateral filter)
+ * - Darken              → line darkening (Anime4K-inspired heuristic, not the Anime4K algorithm)
+ * - Vibrance            → S-curve + selective chroma boost (RGB-space approximation)
+ * - RCAS + USM          → RCAS-style clamped unsharp mask
+ * - Adaptive (smoothstep) → adaptive sharpen, smoothstep edge weight
+ * - Adaptive (sigmoid)  → adaptive sharpen, true logistic-sigmoid edge weight
  *
  * If the GPU renderer fails to initialise (unsupported driver, OOM), tile decoding falls back
  * to returning the unfiltered bitmap — the image remains fully readable.
@@ -67,10 +71,14 @@ public class GpuFilteringDecoder(
         enableDenoise: Boolean  = false,
         enableDarken: Boolean   = false,
         enableVibrance: Boolean = false,
-        sharpenMode: Int        = 0,
-        sharpness: Float        = 0f,
         denoiseStrength: Float   = 0.5f,
         vibranceIntensity: Float = 1f,
+        enableRcasUsm: Boolean = false,
+        rcasUsmIntensity: Float = 0f,
+        enableAdaptiveSmoothstep: Boolean = false,
+        adaptiveSmoothstepIntensity: Float = 0f,
+        enableAdaptiveSigmoid: Boolean = false,
+        adaptiveSigmoidIntensity: Float = 0f,
         // The renderer is shared across all decoder instances produced by this factory so the
         // EGL context is created once per SSIV image load, not once per tile decode worker.
         // Public (not internal): app code in a separate module reads/reuses this renderer
@@ -82,24 +90,19 @@ public class GpuFilteringDecoder(
             renderer.enableDenoise  = enableDenoise
             renderer.enableDarken   = enableDarken
             renderer.enableVibrance = enableVibrance
-            renderer.sharpenMode    = sharpenMode
-            renderer.sharpness      = sharpness
             renderer.denoiseStrength   = denoiseStrength
             renderer.vibranceIntensity = vibranceIntensity
+            renderer.enableRcasUsm = enableRcasUsm
+            renderer.rcasUsmIntensity = rcasUsmIntensity
+            renderer.enableAdaptiveSmoothstep = enableAdaptiveSmoothstep
+            renderer.adaptiveSmoothstepIntensity = adaptiveSmoothstepIntensity
+            renderer.enableAdaptiveSigmoid = enableAdaptiveSigmoid
+            renderer.adaptiveSigmoidIntensity = adaptiveSigmoidIntensity
         }
 
         override val bitmapConfig: Bitmap.Config? get() = innerFactory.bitmapConfig
 
         override fun make(): GpuFilteringDecoder =
             GpuFilteringDecoder(innerFactory.make(), renderer)
-
-        /** Expose renderer state for equality checks in applyBitmapConfig. */
-        val enableDenoise:  Boolean get() = renderer.enableDenoise
-        val enableDarken:   Boolean get() = renderer.enableDarken
-        val enableVibrance: Boolean get() = renderer.enableVibrance
-        val sharpenMode:    Int     get() = renderer.sharpenMode
-        val sharpness:      Float   get() = renderer.sharpness
-        val denoiseStrength:   Float get() = renderer.denoiseStrength
-        val vibranceIntensity: Float get() = renderer.vibranceIntensity
     }
 }

@@ -49,6 +49,11 @@ public class GpuTileRenderer(private val context: Context) {
     private var cachedConfig: EGLConfig? = null
     private var surfaceWidth  = 0
     private var surfaceHeight = 0
+    // GL_MAX_TEXTURE_SIZE of this device; images larger than this are returned unfiltered.
+    private var maxTextureSize = Int.MAX_VALUE
+    // Set by release(); a released renderer never re-initialises itself (in-flight decodes
+    // that still hold a reference would otherwise leak a fresh EGL context).
+    @Volatile private var isReleased = false
 
     private var program    = 0
     private var quadVbo    = 0
@@ -59,36 +64,60 @@ public class GpuTileRenderer(private val context: Context) {
     private var uDenoise    = -1
     private var uDarken     = -1
     private var uVibrance   = -1
-    private var uSharpenMode = -1
-    private var uSharpness  = -1
     private var uDenoiseStrength   = -1
     private var uVibranceIntensity = -1
+    private var uRcasUsm             = -1
+    private var uRcasUsmIntensity    = -1
+    private var uAdaptiveSmoothstep          = -1
+    private var uAdaptiveSmoothstepIntensity = -1
+    private var uAdaptiveSigmoid          = -1
+    private var uAdaptiveSigmoidIntensity = -1
 
+    // Every filter is an independent (enable, intensity) pair — none is mutually exclusive.
     @Volatile var enableDenoise  = false
     @Volatile var enableDarken   = false
     @Volatile var enableVibrance = false
-    @Volatile var sharpenMode    = 0
-    @Volatile var sharpness      = 0f
-    /** Bilateral falloff intensity, 0.0 (mild) .. 1.0 (aggressive). Only used when [enableDenoise]. */
+    /** 3x3 luma-weighted denoise falloff, 0.0 (mild) .. 1.0 (aggressive). Only used when [enableDenoise]. */
     @Volatile var denoiseStrength   = 0.5f
     /** Vibrance boost magnitude, 0.0 (no-op) .. 1.0 (full). Only used when [enableVibrance]. */
     @Volatile var vibranceIntensity = 1f
+    /** Sharpen: RCAS-style clamp + unsharp mask. */
+    @Volatile var enableRcasUsm = false
+    @Volatile var rcasUsmIntensity = 0f
+    /** Sharpen: adaptive, smoothstep (cubic Hermite) edge weight. */
+    @Volatile var enableAdaptiveSmoothstep = false
+    @Volatile var adaptiveSmoothstepIntensity = 0f
+    /** Sharpen: adaptive, true logistic-sigmoid edge weight. */
+    @Volatile var enableAdaptiveSigmoid = false
+    @Volatile var adaptiveSigmoidIntensity = 0f
+
+    private fun hasActiveFilter(): Boolean =
+        enableDenoise || enableDarken || enableVibrance || enableRcasUsm ||
+            enableAdaptiveSmoothstep || enableAdaptiveSigmoid
 
     private var ready = false
 
     // ── Public API ────────────────────────────────────────────────────────────
 
-    fun init(): Boolean = lock.withLock { initLocked() }
+    fun init(): Boolean = lock.withLock {
+        isReleased = false
+        initLocked()
+    }
 
     fun applyFilter(bitmap: Bitmap): Bitmap {
-        if (!enableDenoise && !enableDarken && !enableVibrance && sharpenMode == 0) return bitmap
+        if (isReleased) return bitmap
+        if (!hasActiveFilter()) return bitmap
         return lock.withLock {
+            if (isReleased) return@withLock bitmap
             if (!ready && !initLocked()) return@withLock bitmap
             applyFilterLocked(bitmap)
         }
     }
 
-    fun release() = lock.withLock { releaseLocked() }
+    fun release() = lock.withLock {
+        isReleased = true
+        releaseLocked()
+    }
 
     // ── Init ──────────────────────────────────────────────────────────────────
 
@@ -119,6 +148,10 @@ public class GpuTileRenderer(private val context: Context) {
 
             makeCurrent()
 
+            val maxTex = IntArray(1)
+            GLES30.glGetIntegerv(GLES30.GL_MAX_TEXTURE_SIZE, maxTex, 0)
+            maxTextureSize = if (maxTex[0] > 0) maxTex[0] else 2048
+
             program = buildProgram(loadShaderSource())
             quadVbo = buildQuadVbo()
             quadVao = buildQuadVao(quadVbo)
@@ -128,10 +161,14 @@ public class GpuTileRenderer(private val context: Context) {
             uDenoise     = GLES30.glGetUniformLocation(program, "u_enableDenoise")
             uDarken      = GLES30.glGetUniformLocation(program, "u_enableDarken")
             uVibrance    = GLES30.glGetUniformLocation(program, "u_enableVibrance")
-            uSharpenMode = GLES30.glGetUniformLocation(program, "u_sharpenMode")
-            uSharpness   = GLES30.glGetUniformLocation(program, "u_sharpness")
             uDenoiseStrength   = GLES30.glGetUniformLocation(program, "u_denoiseStrength")
             uVibranceIntensity = GLES30.glGetUniformLocation(program, "u_vibranceIntensity")
+            uRcasUsm          = GLES30.glGetUniformLocation(program, "u_enableRcasUsm")
+            uRcasUsmIntensity = GLES30.glGetUniformLocation(program, "u_rcasUsmIntensity")
+            uAdaptiveSmoothstep          = GLES30.glGetUniformLocation(program, "u_enableAdaptiveSmoothstep")
+            uAdaptiveSmoothstepIntensity = GLES30.glGetUniformLocation(program, "u_adaptiveSmoothstepIntensity")
+            uAdaptiveSigmoid          = GLES30.glGetUniformLocation(program, "u_enableAdaptiveSigmoid")
+            uAdaptiveSigmoidIntensity = GLES30.glGetUniformLocation(program, "u_adaptiveSigmoidIntensity")
 
             releaseCurrent()
             ready = true
@@ -217,61 +254,75 @@ public class GpuTileRenderer(private val context: Context) {
     private fun applyFilterLocked(src: Bitmap): Bitmap {
         val w = src.width
         val h = src.height
+        // Too large for this GPU: return unfiltered rather than failing the decode.
+        if (w > maxTextureSize || h > maxTextureSize) return src
 
         resizeSurfaceIfNeeded(w, h)
         makeCurrent()
 
-        // Upload source bitmap to GL texture
         val texIds = IntArray(1)
-        GLES30.glGenTextures(1, texIds, 0)
-        val texId = texIds[0]
-        GLES30.glBindTexture(GLES30.GL_TEXTURE_2D, texId)
-        GLES30.glTexParameteri(GLES30.GL_TEXTURE_2D, GLES30.GL_TEXTURE_MIN_FILTER, GLES30.GL_LINEAR)
-        GLES30.glTexParameteri(GLES30.GL_TEXTURE_2D, GLES30.GL_TEXTURE_MAG_FILTER, GLES30.GL_LINEAR)
-        GLES30.glTexParameteri(GLES30.GL_TEXTURE_2D, GLES30.GL_TEXTURE_WRAP_S, GLES30.GL_CLAMP_TO_EDGE)
-        GLES30.glTexParameteri(GLES30.GL_TEXTURE_2D, GLES30.GL_TEXTURE_WRAP_T, GLES30.GL_CLAMP_TO_EDGE)
+        try {
+            // Upload source bitmap to GL texture
+            GLES30.glGenTextures(1, texIds, 0)
+            val texId = texIds[0]
+            GLES30.glBindTexture(GLES30.GL_TEXTURE_2D, texId)
+            GLES30.glTexParameteri(GLES30.GL_TEXTURE_2D, GLES30.GL_TEXTURE_MIN_FILTER, GLES30.GL_LINEAR)
+            GLES30.glTexParameteri(GLES30.GL_TEXTURE_2D, GLES30.GL_TEXTURE_MAG_FILTER, GLES30.GL_LINEAR)
+            GLES30.glTexParameteri(GLES30.GL_TEXTURE_2D, GLES30.GL_TEXTURE_WRAP_S, GLES30.GL_CLAMP_TO_EDGE)
+            GLES30.glTexParameteri(GLES30.GL_TEXTURE_2D, GLES30.GL_TEXTURE_WRAP_T, GLES30.GL_CLAMP_TO_EDGE)
 
-        // GLUtils.texImage2D requires ARGB_8888
-        val upload = if (src.config == Bitmap.Config.ARGB_8888) src
-                     else src.copy(Bitmap.Config.ARGB_8888, false)
-        android.opengl.GLUtils.texImage2D(GLES30.GL_TEXTURE_2D, 0, upload, 0)
-        if (upload !== src) upload.recycle()
+            // GLUtils.texImage2D requires ARGB_8888
+            val upload = if (src.config == Bitmap.Config.ARGB_8888) src
+                         else src.copy(Bitmap.Config.ARGB_8888, false)
+            try {
+                android.opengl.GLUtils.texImage2D(GLES30.GL_TEXTURE_2D, 0, upload, 0)
+            } finally {
+                if (upload !== src) upload.recycle()
+            }
 
-        // Draw full-screen quad through shader
-        GLES30.glViewport(0, 0, w, h)
-        GLES30.glUseProgram(program)
-        GLES30.glActiveTexture(GLES30.GL_TEXTURE0)
-        GLES30.glBindTexture(GLES30.GL_TEXTURE_2D, texId)
-        GLES30.glUniform1i(uTexture,     0)
-        GLES30.glUniform2f(uTexelSize,   1f / w, 1f / h)
-        GLES30.glUniform1i(uDenoise,     if (enableDenoise)  1 else 0)
-        GLES30.glUniform1i(uDarken,      if (enableDarken)   1 else 0)
-        GLES30.glUniform1i(uVibrance,    if (enableVibrance) 1 else 0)
-        GLES30.glUniform1i(uSharpenMode, sharpenMode)
-        GLES30.glUniform1f(uSharpness,   sharpness)
-        GLES30.glUniform1f(uDenoiseStrength,   denoiseStrength)
-        GLES30.glUniform1f(uVibranceIntensity, vibranceIntensity)
-        GLES30.glBindVertexArray(quadVao)
-        GLES30.glDrawArrays(GLES30.GL_TRIANGLE_STRIP, 0, 4)
-        GLES30.glBindVertexArray(0)
+            // Draw full-screen quad through shader
+            GLES30.glViewport(0, 0, w, h)
+            GLES30.glUseProgram(program)
+            GLES30.glActiveTexture(GLES30.GL_TEXTURE0)
+            GLES30.glBindTexture(GLES30.GL_TEXTURE_2D, texId)
+            GLES30.glUniform1i(uTexture,     0)
+            GLES30.glUniform2f(uTexelSize,   1f / w, 1f / h)
+            GLES30.glUniform1i(uDenoise,     if (enableDenoise)  1 else 0)
+            GLES30.glUniform1i(uDarken,      if (enableDarken)   1 else 0)
+            GLES30.glUniform1i(uVibrance,    if (enableVibrance) 1 else 0)
+            GLES30.glUniform1f(uDenoiseStrength,   denoiseStrength)
+            GLES30.glUniform1f(uVibranceIntensity, vibranceIntensity)
+            GLES30.glUniform1i(uRcasUsm,          if (enableRcasUsm) 1 else 0)
+            GLES30.glUniform1f(uRcasUsmIntensity, rcasUsmIntensity)
+            GLES30.glUniform1i(uAdaptiveSmoothstep,          if (enableAdaptiveSmoothstep) 1 else 0)
+            GLES30.glUniform1f(uAdaptiveSmoothstepIntensity, adaptiveSmoothstepIntensity)
+            GLES30.glUniform1i(uAdaptiveSigmoid,          if (enableAdaptiveSigmoid) 1 else 0)
+            GLES30.glUniform1f(uAdaptiveSigmoidIntensity, adaptiveSigmoidIntensity)
+            GLES30.glBindVertexArray(quadVao)
+            GLES30.glDrawArrays(GLES30.GL_TRIANGLE_STRIP, 0, 4)
+            GLES30.glBindVertexArray(0)
 
-        // Read back. The quad's texcoord mapping (NDC y=-1 -> v=0) combined with
-        // GLUtils.texImage2D's top-down bitmap upload renders the tile flipped once into
-        // the framebuffer; glReadPixels' bottom-up readback convention exactly cancels
-        // that flip. The result is that this buffer is ALREADY in correct top-down row
-        // order for Bitmap.copyPixelsFromBuffer — do not flip it again (a previous
-        // version of this code did, which produced upside-down tiles).
-        val totalBytes = w * h * 4
-        val pixelBuf   = ByteBuffer.allocateDirect(totalBytes).order(ByteOrder.nativeOrder())
-        GLES30.glReadPixels(0, 0, w, h, GLES30.GL_RGBA, GLES30.GL_UNSIGNED_BYTE, pixelBuf)
-        pixelBuf.position(0)
+            // Read back. The quad's texcoord mapping (NDC y=-1 -> v=0) combined with
+            // GLUtils.texImage2D's top-down bitmap upload renders the tile flipped once into
+            // the framebuffer; glReadPixels' bottom-up readback convention exactly cancels
+            // that flip. The result is that this buffer is ALREADY in correct top-down row
+            // order for Bitmap.copyPixelsFromBuffer — do not flip it again (a previous
+            // version of this code did, which produced upside-down tiles).
+            val totalBytes = w * h * 4
+            val pixelBuf   = ByteBuffer.allocateDirect(totalBytes).order(ByteOrder.nativeOrder())
+            GLES30.glReadPixels(0, 0, w, h, GLES30.GL_RGBA, GLES30.GL_UNSIGNED_BYTE, pixelBuf)
+            pixelBuf.position(0)
 
-        val result = Bitmap.createBitmap(w, h, Bitmap.Config.ARGB_8888)
-        result.copyPixelsFromBuffer(pixelBuf)
-
-        GLES30.glDeleteTextures(1, texIds, 0)
-        releaseCurrent()
-        return result
+            val result = Bitmap.createBitmap(w, h, Bitmap.Config.ARGB_8888)
+            result.copyPixelsFromBuffer(pixelBuf)
+            return result
+        } finally {
+            // Always free the texture and detach the context, even on failure — otherwise the
+            // context stays current on this thread and every later call from another thread
+            // would fail in eglMakeCurrent.
+            if (texIds[0] != 0) GLES30.glDeleteTextures(1, texIds, 0)
+            releaseCurrent()
+        }
     }
 
     // ── EGL helpers ───────────────────────────────────────────────────────────
@@ -286,11 +337,14 @@ public class GpuTileRenderer(private val context: Context) {
     /** Destroys and recreates the pbuffer only when the tile is larger than the current surface. */
     private fun resizeSurfaceIfNeeded(w: Int, h: Int) {
         if (w <= surfaceWidth && h <= surfaceHeight) return
-        EGL14.eglDestroySurface(eglDisplay, eglSurface)
         // Grow by max of both dimensions so e.g. a tall-then-wide sequence doesn't thrash.
         val newW = maxOf(w, surfaceWidth)
         val newH = maxOf(h, surfaceHeight)
-        eglSurface    = createPbuffer(newW, newH)
+        // Create the new pbuffer BEFORE destroying the old one: if creation fails (large
+        // image), the renderer keeps a valid surface instead of a dangling destroyed handle.
+        val newSurface = createPbuffer(newW, newH)
+        EGL14.eglDestroySurface(eglDisplay, eglSurface)
+        eglSurface    = newSurface
         surfaceWidth  = newW
         surfaceHeight = newH
     }
@@ -326,6 +380,7 @@ public class GpuTileRenderer(private val context: Context) {
         cachedConfig  = null
         surfaceWidth  = 0
         surfaceHeight = 0
+        maxTextureSize = Int.MAX_VALUE
     }
 
     companion object {

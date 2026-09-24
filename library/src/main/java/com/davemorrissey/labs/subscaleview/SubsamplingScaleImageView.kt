@@ -40,6 +40,8 @@ import com.davemorrissey.labs.subscaleview.decoder.LiJpegTurboRegionDecoder
 import com.davemorrissey.labs.subscaleview.decoder.SkiaImageRegionDecoder
 import com.davemorrissey.labs.subscaleview.decoder.toUri
 import com.davemorrissey.labs.subscaleview.internal.Anim
+import com.davemorrissey.labs.subscaleview.internal.BicubicRenderer
+import com.davemorrissey.labs.subscaleview.internal.BitmapScaler
 import com.davemorrissey.labs.subscaleview.internal.ClearingLifecycleObserver
 import com.davemorrissey.labs.subscaleview.internal.CompositeImageEventListener
 import com.davemorrissey.labs.subscaleview.internal.GestureListener
@@ -47,7 +49,9 @@ import com.davemorrissey.labs.subscaleview.internal.InternalErrorHandler
 import com.davemorrissey.labs.subscaleview.internal.ScaleAndTranslate
 import com.davemorrissey.labs.subscaleview.internal.Tile
 import com.davemorrissey.labs.subscaleview.internal.TileMap
+import com.davemorrissey.labs.subscaleview.internal.SettledScaler
 import com.davemorrissey.labs.subscaleview.internal.TouchEventDelegate
+import com.davemorrissey.labs.subscaleview.internal.createBitmapScaler
 import com.davemorrissey.labs.subscaleview.internal.getExifOrientation
 import com.davemorrissey.labs.subscaleview.internal.isTilingEnabled
 import com.davemorrissey.labs.subscaleview.internal.panBy
@@ -360,6 +364,49 @@ public open class SubsamplingScaleImageView @JvmOverloads constructor(
 			bitmapPaint?.colorFilter = value
 		}
 
+	/**
+	 * Resampling used when a bitmap is drawn magnified (zoomed in past 1:1). On Android 13+ it is
+	 * applied live every frame (AGSL, hardware canvas); on older Android it is applied once the
+	 * view stops moving (off-screen GLES 3.0). Whenever the bitmap is drawn at or below 1:1, rotated,
+	 * or the scaler cannot run, [ImageScaler.DEFAULT] is used. See [ImageScaler].
+	 */
+	public var scaler: ImageScaler = ImageScaler.DEFAULT
+		set(value) {
+			if (field != value) {
+				field = value
+				bitmapScaler = null
+				settledScaler?.release()
+				settledScaler = null
+				isScalerFailed = false
+				if (value != ImageScaler.DEFAULT && Build.VERSION.SDK_INT < Build.VERSION_CODES.TIRAMISU) {
+					BicubicRenderer.instance.warmUpAsync()
+				}
+				invalidate()
+			}
+		}
+
+	private var bitmapScaler: BitmapScaler? = null
+
+	// Pre-Android-13 scaler: see [SettledScaler]. Created lazily on the first eligible draw.
+	private var settledScaler: SettledScaler? = null
+	private val settleVisibleRect = Rect()
+	private val settleHost = object : SettledScaler.Host {
+		override fun isBusy(): Boolean = anim != null || isZooming || isPanning || isQuickScaling
+
+		override fun fillSignature(out: SettledScaler.Signature): Boolean = fillSettleSignature(out)
+
+		override fun collectItems(out: MutableList<BicubicRenderer.Item>): Boolean = collectSettleItems(out)
+
+		override fun onPermanentFailure() {
+			isScalerFailed = true
+			settledScaler?.release()
+			settledScaler = null
+		}
+	}
+
+	// Set when a scaler could not be created or threw while drawing; disables it until [scaler] changes.
+	private var isScalerFailed = false
+
 	private var pendingState: ImageViewState? = null
 
 	private var stateRestoreStrategy: Int = RESTORE_STRATEGY_NONE
@@ -456,7 +503,7 @@ public open class SubsamplingScaleImageView @JvmOverloads constructor(
 						Bitmap.createBitmap(
 							imageSource.bitmap,
 							region.left,
-							region.right,
+							region.top,
 							region.width(),
 							region.height(),
 						),
@@ -487,6 +534,9 @@ public open class SubsamplingScaleImageView @JvmOverloads constructor(
 	public open fun recycle() {
 		reset(true)
 		bitmapPaint = null
+		bitmapScaler = null
+		settledScaler?.release()
+		settledScaler = null
 		debugTextPaint = null
 		debugLinePaint = null
 		tileBgPaint = null
@@ -721,7 +771,17 @@ public open class SubsamplingScaleImageView @JvmOverloads constructor(
 								)
 							}
 							matrix2!!.setPolyToPoly(srcArray, 0, dstArray, 0, 4)
-							canvas.drawBitmap(tileBitmap, matrix2!!, bitmapPaint)
+							if (!drawWithScaler(
+									canvas,
+									tileBitmap,
+									tile.vRect.left.toFloat(),
+									tile.vRect.top.toFloat(),
+									tile.vRect.width().toFloat() / tileBitmap.width,
+									tile.vRect.height().toFloat() / tileBitmap.height,
+								)
+							) {
+								canvas.drawBitmap(tileBitmap, matrix2!!, bitmapPaint)
+							}
 							if (isDebugDrawingEnabled) {
 								canvas.drawRect(tile.vRect, debugLinePaint!!)
 							}
@@ -782,8 +842,11 @@ public open class SubsamplingScaleImageView @JvmOverloads constructor(
 				matrix2!!.mapRect(sRect)
 				canvas.drawRect(sRect!!, tileBgPaint!!)
 			}
-			canvas.drawBitmap(bitmap!!, matrix2!!, bitmapPaint)
+			if (!drawWithScaler(canvas, bitmap!!, vTranslate!!.x, vTranslate!!.y, xScale, yScale)) {
+				canvas.drawBitmap(bitmap!!, matrix2!!, bitmapPaint)
+			}
 		}
+		drawSettledOverlay(canvas)
 		if (isDebugDrawingEnabled) {
 			canvas.drawText(
 				"Scale: " + String.format(Locale.ENGLISH, "%.2f", scale) + " (" + String.format(
@@ -821,6 +884,149 @@ public open class SubsamplingScaleImageView @JvmOverloads constructor(
 				debugTextPaint!!,
 			)
 		}
+	}
+
+	/**
+	 * Draws [source] through the selected [scaler] and returns `true`, or returns `false` (having
+	 * drawn nothing) when the caller must draw with the default bilinear path. Only unrotated,
+	 * magnified (both axes > 1 destination pixel per source pixel) hardware-canvas draws qualify.
+	 */
+	private fun drawWithScaler(
+		canvas: Canvas,
+		source: Bitmap,
+		originX: Float,
+		originY: Float,
+		scaleX: Float,
+		scaleY: Float,
+	): Boolean {
+		if (scaler == ImageScaler.DEFAULT || isScalerFailed) return false
+		if (Build.VERSION.SDK_INT < Build.VERSION_CODES.TIRAMISU || !canvas.isHardwareAccelerated) return false
+		if (getRequiredRotation() != ORIENTATION_0) return false
+		if (scaleX <= MIN_SCALER_MAGNIFICATION || scaleY <= MIN_SCALER_MAGNIFICATION) return false
+		return try {
+			val impl = bitmapScaler ?: createBitmapScaler(scaler)?.also { bitmapScaler = it }
+			if (impl == null) {
+				isScalerFailed = true
+				false
+			} else {
+				impl.draw(canvas, source, originX, originY, scaleX, scaleY, colorFilter)
+				true
+			}
+		} catch (e: Throwable) {
+			Log.w(TAG, "Scaler $scaler failed, falling back to the default scaler: $e")
+			isScalerFailed = true
+			bitmapScaler = null
+			false
+		}
+	}
+
+	override fun onDetachedFromWindow() {
+		// Free the viewport-sized overlay (and cancel its pending bake) while off-screen, and drop
+		// the AGSL scaler, which keeps a reference to the last bitmap it drew.
+		settledScaler?.release()
+		settledScaler = null
+		bitmapScaler = null
+		super.onDetachedFromWindow()
+	}
+
+	/** Draws (or schedules) the settled bicubic overlay used below Android 13. */
+	private fun drawSettledOverlay(canvas: Canvas) {
+		if (scaler == ImageScaler.DEFAULT || isScalerFailed || Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
+			settledScaler?.let {
+				it.release()
+				settledScaler = null
+			}
+			return
+		}
+		val settled = settledScaler ?: SettledScaler(this, settleHost).also { settledScaler = it }
+		settled.onDraw(canvas, colorFilter)
+	}
+
+	/**
+	 * Describes what [onDraw] currently draws. Returns `false` when a settled overlay must not be
+	 * used: not ready, rotated, a tile background is set, tiles are still missing, or the content is
+	 * not magnified.
+	 */
+	private fun fillSettleSignature(out: SettledScaler.Signature): Boolean {
+		val translate = vTranslate ?: return false
+		if (!isReady || tileBgPaint != null || getRequiredRotation() != ORIENTATION_0) return false
+		if (width <= 0 || height <= 0) return false
+		val visible = settleVisibleRect
+		if (!getLocalVisibleRect(visible) || visible.isEmpty) return false
+		var hash = 1
+		var minMagnification = Float.MAX_VALUE
+		val drawn = forEachDrawnBitmap { drawnBitmap, _, _, sx, sy ->
+			hash = 31 * hash + System.identityHashCode(drawnBitmap)
+			minMagnification = minOf(minMagnification, sx, sy)
+		}
+		if (!drawn || minMagnification <= MIN_SCALER_MAGNIFICATION) return false
+		out.scaler = scaler
+		out.scale = scale
+		out.translateX = translate.x
+		out.translateY = translate.y
+		out.viewWidth = width
+		out.viewHeight = height
+		out.visible.set(visible)
+		out.contentHash = hash
+		return true
+	}
+
+	/** Lists the currently drawn bitmaps that intersect the visible area. */
+	private fun collectSettleItems(out: MutableList<BicubicRenderer.Item>): Boolean {
+		val visible = settleVisibleRect
+		if (!getLocalVisibleRect(visible)) return false
+		return forEachDrawnBitmap { drawnBitmap, x, y, sx, sy ->
+			if (x < visible.right && y < visible.bottom &&
+				x + drawnBitmap.width * sx > visible.left && y + drawnBitmap.height * sy > visible.top
+			) {
+				out.add(BicubicRenderer.Item(drawnBitmap, x, y, sx, sy))
+			}
+		}
+	}
+
+	/**
+	 * Mirrors exactly which bitmaps [onDraw] draws (same layer choice, same placement) and calls
+	 * [action] with (bitmap, left, top, destination pixels per source pixel x/y) for each. Returns
+	 * `false` if nothing complete can be drawn (missing tiles, no bitmap).
+	 */
+	private inline fun forEachDrawnBitmap(action: (Bitmap, Float, Float, Float, Float) -> Unit): Boolean {
+		val tiles = tileMap
+		if (tiles != null && isBaseLayerReady()) {
+			val sampleSize = calculateInSampleSize(scale).coerceAtMost(fullImageSampleSize)
+			if (tiles.hasMissingTiles(sampleSize)) return false
+			val layer = tiles[sampleSize] ?: return false
+			var any = false
+			for (tile in layer) {
+				val tileBitmap = tile.bitmap
+				if (tileBitmap == null || tileBitmap.isRecycled) continue
+				sourceToViewRect(tile.sRect, tile.vRect)
+				action(
+					tileBitmap,
+					tile.vRect.left.toFloat(),
+					tile.vRect.top.toFloat(),
+					tile.vRect.width().toFloat() / tileBitmap.width,
+					tile.vRect.height().toFloat() / tileBitmap.height,
+				)
+				any = true
+			}
+			return any
+		}
+		val wholeBitmap = bitmap
+		val translate = vTranslate
+		if (wholeBitmap != null && !wholeBitmap.isRecycled && translate != null) {
+			var xScale = scale
+			var yScale = scale
+			if (bitmapIsPreview) {
+				xScale = scale * (sWidth.toFloat() / wholeBitmap.width)
+				yScale = scale * (sHeight.toFloat() / wholeBitmap.height)
+			} else if (_downSampling != 1) {
+				xScale *= _downSampling
+				yScale *= _downSampling
+			}
+			action(wholeBitmap, translate.x, translate.y, xScale, yScale)
+			return true
+		}
+		return false
 	}
 
 	private fun getMaxBitmapDimensions(canvas: Canvas) = Point(
@@ -1915,6 +2121,10 @@ public open class SubsamplingScaleImageView @JvmOverloads constructor(
 
 		public const val TILE_SIZE_AUTO: Int = Integer.MAX_VALUE
 		internal const val TAG = "SSIV"
+
+		// A custom scaler is only used when every source pixel covers clearly more than one
+		// destination pixel; at ~1:1 a bicubic kernel is either a no-op (Catmull-Rom) or a needless blur.
+		private const val MIN_SCALER_MAGNIFICATION = 1.001f
 
 		public const val ORIENTATION_USE_EXIF: Int = -1
 		public const val ORIENTATION_0: Int = 0

@@ -1,27 +1,50 @@
 #version 300 es
 precision mediump float;
 
-in vec2 v_texCoord;
+// Texture coordinates and texel size need highp: at mediump (fp16 on many mobile GPUs) a
+// coordinate near 1.0 has ~0.0005 resolution, which is about half a texel on a 1000 px wide
+// tile — enough to corrupt the 3x3 neighbourhood offsets.
+in highp vec2 v_texCoord;
 out vec4 fragColor;
 
 uniform sampler2D u_texture;
-uniform vec2      u_texelSize;     // (1.0/width, 1.0/height)
+uniform highp vec2 u_texelSize;    // (1.0/width, 1.0/height)
 
-uniform bool  u_enableDenoise;     // Bilateral Denoise
-uniform bool  u_enableDarken;      // Anime4K Line Darken
-uniform bool  u_enableVibrance;    // Vibrance / S-Curve
-uniform int   u_sharpenMode;       // 0=Off  1=RCAS+USM  2=Adaptive
-uniform float u_sharpness;         // 0.0..1.0
-uniform float u_denoiseStrength;   // 0.0..1.0 — drives the bilateral falloff constant
-uniform float u_vibranceIntensity; // 0.0..1.0 — magnitude of the vibrance boost
+// Every filter follows the same pattern: an enable flag plus an intensity, independent of
+// all the others. Filters stack; none of them is mutually exclusive with another.
+uniform bool  u_enableDenoise;               // 3x3 luma-weighted denoise
+uniform float u_denoiseStrength;             // 0.0..1.0 — drives the luma falloff constant
+uniform bool  u_enableDarken;                // Line darken (Anime4K-inspired, not a port)
+uniform bool  u_enableVibrance;              // Vibrance / S-curve (RGB-space approximation)
+uniform float u_vibranceIntensity;           // 0.0..1.0 — magnitude of the vibrance boost
+uniform bool  u_enableRcasUsm;               // Sharpen: RCAS-style clamp + unsharp mask
+uniform float u_rcasUsmIntensity;            // 0.0..1.0
+uniform bool  u_enableAdaptiveSmoothstep;    // Sharpen: adaptive, smoothstep edge weight
+uniform float u_adaptiveSmoothstepIntensity; // 0.0..1.0
+uniform bool  u_enableAdaptiveSigmoid;       // Sharpen: adaptive, true logistic-sigmoid edge weight
+uniform float u_adaptiveSigmoidIntensity;    // 0.0..1.0
 
 float getLuma(vec3 c) {
     return dot(c, vec3(0.299, 0.587, 0.114));
 }
 
+// Logistic sigmoid 1/(1+e^-x), scaled and biased so the edge weight is exactly 0 at zero
+// edge strength and exactly 1 at edge strength 0.5 (the practical maximum of |luma - blur|),
+// with the steep part of the curve centred on edge strength 0.12.
+float sigmoidEdgeWeight(float edge) {
+    const float k   = 28.0;    // steepness
+    const float mid = 0.12;    // edge strength at which the weight crosses 0.5 (pre-normalisation)
+    // Plain (non-const) floats on purpose: every GLSL compiler folds them, and no driver can
+    // reject the program over constant-expression rules for exp().
+    float lo = 1.0 / (1.0 + exp( k * mid));           // sigmoid at edge = 0
+    float hi = 1.0 / (1.0 + exp(-k * (0.5 - mid)));   // sigmoid at edge = 0.5
+    float s = 1.0 / (1.0 + exp(-k * (edge - mid)));
+    return clamp((s - lo) / (hi - lo), 0.0, 1.0);
+}
+
 void main() {
     // ── 1. Single 9-tap neighbourhood fetch ─────────────────────────────────
-    vec2 o = u_texelSize;
+    highp vec2 o = u_texelSize;
     vec3 c5 = texture(u_texture, v_texCoord).rgb;
     vec3 c1 = texture(u_texture, v_texCoord + vec2(-o.x, -o.y)).rgb;
     vec3 c2 = texture(u_texture, v_texCoord + vec2( 0.0, -o.y)).rgb;
@@ -34,10 +57,12 @@ void main() {
 
     vec3 color = c5;
 
-    // ── 2. Light Bilateral Denoise ───────────────────────────────────────────
+    // ── 2. 3x3 luma-weighted denoise ─────────────────────────────────────────
+    // Range-only weighting (luma difference); there is no spatial Gaussian term, so this is
+    // NOT a true bilateral filter.
     if (u_enableDenoise) {
-        float l5 = getLuma(c5);
-        vec3 accum = c5;
+        float l5 = getLuma(color);
+        vec3 accum = color;
         float wSum = 1.0;
 
         // Unrolled loop — avoids dynamic indexing on PowerVR
@@ -59,7 +84,8 @@ void main() {
         color = accum / wSum;
     }
 
-    // ── 3. Anime4K Line Darken ───────────────────────────────────────────────
+    // ── 3. Line darken (Anime4K-inspired heuristic, not the Anime4K algorithm) ──
+    // Pulls dark pixels toward their darkest 8-neighbour below luma 0.6, capped at 35% blend.
     if (u_enableDarken) {
         float lumaC = getLuma(color);
         float minLuma = min(min(min(getLuma(c1), getLuma(c2)), getLuma(c3)),
@@ -72,27 +98,39 @@ void main() {
         }
     }
 
-    // ── 4. Sharpening ────────────────────────────────────────────────────────
-    if (u_sharpenMode == 1 && u_sharpness > 0.0) {
-        // RCAS + USM hybrid
+    // ── 4. Sharpening — three independent, stackable filters ─────────────────
+    if (u_enableRcasUsm && u_rcasUsmIntensity > 0.0) {
+        // RCAS-style local min/max clamp + unsharp-mask delta
         vec3 mn  = min(min(min(c2, c4), min(c6, c8)), c5);
         vec3 mx  = max(max(max(c2, c4), max(c6, c8)), c5);
         vec3 blur = (c2 + c4 + c6 + c8) * 0.25;
         vec3 usm  = color - blur;
         vec3 lim  = min(color - mn, mx - color);
-        vec3 delta = clamp(usm * (1.0 + u_sharpness * 2.0), -lim, lim);
+        vec3 delta = clamp(usm * (1.0 + u_rcasUsmIntensity * 2.0), -lim, lim);
         color = clamp(color + delta, 0.0, 1.0);
+    }
 
-    } else if (u_sharpenMode == 2 && u_sharpness > 0.0) {
-        // Adaptive-Sharpen (sigmoid edge-aware)
-        float lC   = getLuma(color);
+    if (u_enableAdaptiveSmoothstep && u_adaptiveSmoothstepIntensity > 0.0) {
+        // Adaptive-Sharpen, smoothstep (cubic Hermite) edge weight
+        float lC    = getLuma(color);
         float lBlur = (getLuma(c2) + getLuma(c4) + getLuma(c6) + getLuma(c8)) * 0.25;
         float edgeD = abs(lC - lBlur);
-        float adaptW = smoothstep(0.02, 0.25, edgeD) * u_sharpness;
+        float adaptW = smoothstep(0.02, 0.25, edgeD) * u_adaptiveSmoothstepIntensity;
+        color = clamp(color + (color - vec3(lBlur)) * adaptW * 1.5, 0.0, 1.0);
+    }
+
+    if (u_enableAdaptiveSigmoid && u_adaptiveSigmoidIntensity > 0.0) {
+        // Adaptive-Sharpen, true logistic-sigmoid edge weight
+        float lC    = getLuma(color);
+        float lBlur = (getLuma(c2) + getLuma(c4) + getLuma(c6) + getLuma(c8)) * 0.25;
+        float edgeD = abs(lC - lBlur);
+        float adaptW = sigmoidEdgeWeight(edgeD) * u_adaptiveSigmoidIntensity;
         color = clamp(color + (color - vec3(lBlur)) * adaptW * 1.5, 0.0, 1.0);
     }
 
     // ── 5. Vibrance / S-Curve ────────────────────────────────────────────────
+    // Deliberate RGB-space approximation (not HSL vibrance): smoothstep-polynomial S-curve
+    // plus a selective saturation boost weighted inversely by the current max-min RGB gap.
     if (u_enableVibrance) {
         vec3 base = color;
         // Smooth S-curve contrast
