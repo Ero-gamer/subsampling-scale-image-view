@@ -81,9 +81,9 @@ val javadocs by configurations.creating
 dependencies {
     implementation("org.jetbrains.kotlin:kotlin-stdlib:2.3.20")
     implementation("androidx.customview:customview:1.2.0")
-    javadocs("androidx.annotation:annotation:1.10.0")
+    javadocs("androidx.annotation:annotation:1.11.0")
     javadocs("androidx.exifinterface:exifinterface:1.4.2")
-    implementation("androidx.annotation:annotation:1.10.0")
+    implementation("androidx.annotation:annotation:1.11.0")
     implementation("androidx.exifinterface:exifinterface:1.4.2")
     implementation("androidx.lifecycle:lifecycle-runtime-ktx:2.11.0")
     implementation("org.jetbrains.kotlinx:kotlinx-coroutines-android:1.11.0")
