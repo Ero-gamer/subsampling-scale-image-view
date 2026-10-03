@@ -37,7 +37,6 @@ import com.davemorrissey.labs.subscaleview.decoder.ImageDecoder
 import com.davemorrissey.labs.subscaleview.decoder.ImageRegionDecoder
 import com.davemorrissey.labs.subscaleview.decoder.SkiaImageDecoder
 import com.davemorrissey.labs.subscaleview.decoder.LiJpegTurboRegionDecoder
-import com.davemorrissey.labs.subscaleview.decoder.SkiaImageRegionDecoder
 import com.davemorrissey.labs.subscaleview.decoder.toUri
 import com.davemorrissey.labs.subscaleview.internal.Anim
 import com.davemorrissey.labs.subscaleview.internal.BicubicRenderer
@@ -51,6 +50,7 @@ import com.davemorrissey.labs.subscaleview.internal.Tile
 import com.davemorrissey.labs.subscaleview.internal.TileMap
 import com.davemorrissey.labs.subscaleview.internal.SettledScaler
 import com.davemorrissey.labs.subscaleview.internal.TouchEventDelegate
+import com.davemorrissey.labs.subscaleview.internal.createBitmapDownscaler
 import com.davemorrissey.labs.subscaleview.internal.createBitmapScaler
 import com.davemorrissey.labs.subscaleview.internal.getExifOrientation
 import com.davemorrissey.labs.subscaleview.internal.isTilingEnabled
@@ -377,7 +377,9 @@ public open class SubsamplingScaleImageView @JvmOverloads constructor(
 				bitmapScaler = null
 				settledScaler?.release()
 				settledScaler = null
+				// A permanent GL failure disables both regimes, so a retry re-enables both.
 				isScalerFailed = false
+				isDownscalerFailed = false
 				if (value != ImageScaler.DEFAULT && Build.VERSION.SDK_INT < Build.VERSION_CODES.TIRAMISU) {
 					BicubicRenderer.instance.warmUpAsync()
 				}
@@ -385,7 +387,29 @@ public open class SubsamplingScaleImageView @JvmOverloads constructor(
 			}
 		}
 
+	/**
+	 * Resampling used when a bitmap is drawn minified (zoomed out below 1:1). Independent of
+	 * [scaler]; same delivery (AGSL live on Android 13+, settled GLES 3.0 pass before). See
+	 * [ImageDownscaler].
+	 */
+	public var downscaler: ImageDownscaler = ImageDownscaler.DEFAULT
+		set(value) {
+			if (field != value) {
+				field = value
+				bitmapDownscaler = null
+				settledScaler?.release()
+				settledScaler = null
+				isScalerFailed = false
+				isDownscalerFailed = false
+				if (value != ImageDownscaler.DEFAULT && Build.VERSION.SDK_INT < Build.VERSION_CODES.TIRAMISU) {
+					BicubicRenderer.instance.warmUpAsync()
+				}
+				invalidate()
+			}
+		}
+
 	private var bitmapScaler: BitmapScaler? = null
+	private var bitmapDownscaler: BitmapScaler? = null
 
 	// Pre-Android-13 scaler: see [SettledScaler]. Created lazily on the first eligible draw.
 	private var settledScaler: SettledScaler? = null
@@ -398,7 +422,9 @@ public open class SubsamplingScaleImageView @JvmOverloads constructor(
 		override fun collectItems(out: MutableList<BicubicRenderer.Item>): Boolean = collectSettleItems(out)
 
 		override fun onPermanentFailure() {
+			// The settled path shares one GL program for both regimes: a failure is global.
 			isScalerFailed = true
+			isDownscalerFailed = true
 			settledScaler?.release()
 			settledScaler = null
 		}
@@ -406,6 +432,7 @@ public open class SubsamplingScaleImageView @JvmOverloads constructor(
 
 	// Set when a scaler could not be created or threw while drawing; disables it until [scaler] changes.
 	private var isScalerFailed = false
+	private var isDownscalerFailed = false
 
 	private var pendingState: ImageViewState? = null
 
@@ -535,6 +562,7 @@ public open class SubsamplingScaleImageView @JvmOverloads constructor(
 		reset(true)
 		bitmapPaint = null
 		bitmapScaler = null
+		bitmapDownscaler = null
 		settledScaler?.release()
 		settledScaler = null
 		debugTextPaint = null
@@ -887,9 +915,10 @@ public open class SubsamplingScaleImageView @JvmOverloads constructor(
 	}
 
 	/**
-	 * Draws [source] through the selected [scaler] and returns `true`, or returns `false` (having
-	 * drawn nothing) when the caller must draw with the default bilinear path. Only unrotated,
-	 * magnified (both axes > 1 destination pixel per source pixel) hardware-canvas draws qualify.
+	 * Draws [source] through the selected [scaler] (magnified) or [downscaler] (minified) and
+	 * returns `true`, or returns `false` (having drawn nothing) when the caller must draw with the
+	 * default bilinear path. Only unrotated hardware-canvas draws whose scale is clearly above or
+	 * clearly below 1 on both axes qualify.
 	 */
 	private fun drawWithScaler(
 		canvas: Canvas,
@@ -899,23 +928,39 @@ public open class SubsamplingScaleImageView @JvmOverloads constructor(
 		scaleX: Float,
 		scaleY: Float,
 	): Boolean {
-		if (scaler == ImageScaler.DEFAULT || isScalerFailed) return false
-		if (Build.VERSION.SDK_INT < Build.VERSION_CODES.TIRAMISU || !canvas.isHardwareAccelerated) return false
-		if (getRequiredRotation() != ORIENTATION_0) return false
-		if (scaleX <= MIN_SCALER_MAGNIFICATION || scaleY <= MIN_SCALER_MAGNIFICATION) return false
+		if (Build.VERSION.SDK_INT < Build.VERSION_CODES.TIRAMISU) return false
+		val magnified = scaleX > MIN_SCALER_MAGNIFICATION && scaleY > MIN_SCALER_MAGNIFICATION
+		val minified = scaleX < MAX_DOWNSCALER_SCALE && scaleY < MAX_DOWNSCALER_SCALE
+		if (magnified) {
+			if (scaler == ImageScaler.DEFAULT || isScalerFailed) return false
+		} else if (minified) {
+			if (downscaler == ImageDownscaler.DEFAULT || isDownscalerFailed) return false
+		} else {
+			return false
+		}
+		if (!canvas.isHardwareAccelerated || getRequiredRotation() != ORIENTATION_0) return false
 		return try {
-			val impl = bitmapScaler ?: createBitmapScaler(scaler)?.also { bitmapScaler = it }
+			val impl = if (magnified) {
+				bitmapScaler ?: createBitmapScaler(scaler)?.also { bitmapScaler = it }
+			} else {
+				bitmapDownscaler ?: createBitmapDownscaler(downscaler)?.also { bitmapDownscaler = it }
+			}
 			if (impl == null) {
-				isScalerFailed = true
+				if (magnified) isScalerFailed = true else isDownscalerFailed = true
 				false
 			} else {
 				impl.draw(canvas, source, originX, originY, scaleX, scaleY, colorFilter)
 				true
 			}
 		} catch (e: Throwable) {
-			Log.w(TAG, "Scaler $scaler failed, falling back to the default scaler: $e")
-			isScalerFailed = true
-			bitmapScaler = null
+			Log.w(TAG, "Scaler failed, falling back to the default (magnified=$magnified): $e")
+			if (magnified) {
+				isScalerFailed = true
+				bitmapScaler = null
+			} else {
+				isDownscalerFailed = true
+				bitmapDownscaler = null
+			}
 			false
 		}
 	}
@@ -926,12 +971,15 @@ public open class SubsamplingScaleImageView @JvmOverloads constructor(
 		settledScaler?.release()
 		settledScaler = null
 		bitmapScaler = null
+		bitmapDownscaler = null
 		super.onDetachedFromWindow()
 	}
 
 	/** Draws (or schedules) the settled bicubic overlay used below Android 13. */
 	private fun drawSettledOverlay(canvas: Canvas) {
-		if (scaler == ImageScaler.DEFAULT || isScalerFailed || Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
+		val magnifyOff = scaler == ImageScaler.DEFAULT || isScalerFailed
+		val minifyOff = downscaler == ImageDownscaler.DEFAULT || isDownscalerFailed
+		if ((magnifyOff && minifyOff) || Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
 			settledScaler?.let {
 				it.release()
 				settledScaler = null
@@ -955,12 +1003,19 @@ public open class SubsamplingScaleImageView @JvmOverloads constructor(
 		if (!getLocalVisibleRect(visible) || visible.isEmpty) return false
 		var hash = 1
 		var minMagnification = Float.MAX_VALUE
+		var maxMagnification = 0f
 		val drawn = forEachDrawnBitmap { drawnBitmap, _, _, sx, sy ->
 			hash = 31 * hash + System.identityHashCode(drawnBitmap)
 			minMagnification = minOf(minMagnification, sx, sy)
+			maxMagnification = maxOf(maxMagnification, sx, sy)
 		}
-		if (!drawn || minMagnification <= MIN_SCALER_MAGNIFICATION) return false
-		out.scaler = scaler
+		if (!drawn) return false
+		// All drawn bitmaps must be in the same regime: magnified (bicubic) or minified (DPID).
+		val magnified = minMagnification > MIN_SCALER_MAGNIFICATION && !(scaler == ImageScaler.DEFAULT || isScalerFailed)
+		val minified = maxMagnification < MAX_DOWNSCALER_SCALE && !(downscaler == ImageDownscaler.DEFAULT || isDownscalerFailed)
+		if (!magnified && !minified) return false
+		out.minify = !magnified
+		out.scaler = if (magnified) scaler else ImageScaler.DEFAULT
 		out.scale = scale
 		out.translateX = translate.x
 		out.translateY = translate.y
@@ -2125,6 +2180,9 @@ public open class SubsamplingScaleImageView @JvmOverloads constructor(
 		// A custom scaler is only used when every source pixel covers clearly more than one
 		// destination pixel; at ~1:1 a bicubic kernel is either a no-op (Catmull-Rom) or a needless blur.
 		private const val MIN_SCALER_MAGNIFICATION = 1.001f
+
+		/** Mirror of [MIN_SCALER_MAGNIFICATION] for the downscaler: below this on both axes. */
+		private const val MAX_DOWNSCALER_SCALE = 0.999f
 
 		public const val ORIENTATION_USE_EXIF: Int = -1
 		public const val ORIENTATION_0: Int = 0

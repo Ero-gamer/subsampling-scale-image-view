@@ -16,19 +16,27 @@ package com.davemorrissey.labs.subscaleview
  *   [DEFAULT].
  */
 public enum class ImageScaler {
-    /** Android's canvas bilinear filtering (the historical SSIV behaviour). */
-    DEFAULT,
+	/** Android's canvas bilinear filtering (the historical SSIV behaviour). */
+	DEFAULT,
 
-    /**
-     * Exact Catmull-Rom bicubic (9 bilinear taps, negative outer lobes kept). Sharpest of the
-     * three when zooming in; can show slight ringing on very high-contrast edges.
-     */
-    CATMULL_ROM,
+	/**
+	 * Exact Catmull-Rom bicubic (9 bilinear taps, negative outer lobes kept). Sharpest of the
+	 * bicubic scalers when zooming in; can show slight ringing on very high-contrast edges.
+	 */
+	CATMULL_ROM,
 
-    /**
-     * Cubic B-Spline bicubic (4 bilinear taps, all weights positive). Smooth, no ringing, but
-     * softer than Catmull-Rom.
-     */
-    BSPLINE,
-    ;
+	/**
+	 * Keys cubic (B, C) = (0.37821575509399867, 0.31089212245300067) — ImageMagick's
+	 * `RobidouxFilter` constants (see [com.davemorrissey.labs.subscaleview.internal.ScalerShaderSource]).
+	 * Tuned so a pure translation exactly preserves horizontal/vertical lines, a property plain
+	 * Catmull-Rom lacks; a middle ground between Catmull-Rom's sharpness and plain bilinear softness.
+	 */
+	ROBIDOUX,
+
+	/**
+	 * A sharper variant of [ROBIDOUX], (B, C) = (0.2620145123990142, 0.3689927438004929) —
+	 * ImageMagick's `RobidouxSharpFilter` constants. Tuned to minimise the maximum change to a
+	 * pixel value already at an extreme (0 or 1) under a no-op resample.
+	 */
+	ROBIDOUX_SHARP,
 }
