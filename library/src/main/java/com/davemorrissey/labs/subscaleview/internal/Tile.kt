@@ -2,6 +2,7 @@ package com.davemorrissey.labs.subscaleview.internal
 
 import android.graphics.Bitmap
 import android.graphics.Rect
+import android.graphics.RectF
 
 /**
  * A single tile in the tiled image grid.
@@ -52,6 +53,15 @@ internal class Tile {
     @JvmField
     var isValid: Boolean = false
 
+    /**
+     * Incremented by [recycle]. A background decode captures the value when it is launched and
+     * discards its result (and skips the decode entirely if it has not started yet) when the value
+     * has changed, so a tile that was evicted while queued or decoding can neither resurrect itself
+     * nor leave a second concurrent load racing the next one.
+     */
+    @Volatile
+    var epoch: Int = 0
+
     @JvmField
     var sRect: Rect = Rect()
 
@@ -62,9 +72,19 @@ internal class Tile {
     val fileSRect: Rect = Rect()
 
     /**
+     * Whether this tile's source rect overlaps [r]. NaN-tolerant on purpose: before the first layout
+     * (no translation yet) [r] is NaN and every tile counts as intersecting.
+     */
+    fun intersects(r: RectF): Boolean = !(r.left > sRect.right || sRect.left > r.right || r.top > sRect.bottom || sRect.top > r.bottom)
+
+    /** True when this tile belongs to the target [sampleSize] level and has no valid bitmap or load in flight. */
+    fun needsLoad(sampleSize: Int): Boolean = this.sampleSize == sampleSize && !isLoading && (!isValid || bitmap == null)
+
+    /**
      * Recycles this tile's bitmap and resets state. **Must be called from the main thread.**
      */
     fun recycle() {
+        epoch++
         isVisible = false
         isLoading = false
         isValid = false

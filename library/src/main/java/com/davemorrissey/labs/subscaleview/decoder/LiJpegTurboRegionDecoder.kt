@@ -123,6 +123,7 @@ public class LiJpegTurboRegionDecoder(
                     imageWidth, imageHeight,
                     sampleSize.coerceAtLeast(1),
                     sRect.left, sRect.top, sRect.right, sRect.bottom,
+                    quality.toBitmapConfig() == Bitmap.Config.RGB_565,
                 )
                 if (bmp != null) return bmp
                 // Native decode failed — fall through to BitmapRegionDecoder.
@@ -398,6 +399,8 @@ public class LiJpegTurboRegionDecoder(
      * Only the MCU blocks overlapping the requested region are decompressed —
      * no full-image decode ever occurs.
      *
+     * [rgb565] returns an RGB_565 bitmap (ordered-dithered) instead of ARGB_8888.
+     *
      * Returns null on failure — caller falls back to BitmapRegionDecoder.
      */
     private external fun nativeDecodeRegion(
@@ -409,5 +412,6 @@ public class LiJpegTurboRegionDecoder(
         sRectTop:    Int,
         sRectRight:  Int,
         sRectBottom: Int,
+        rgb565:      Boolean,
     ): Bitmap?
 }

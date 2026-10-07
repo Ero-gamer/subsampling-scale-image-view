@@ -260,6 +260,36 @@ internal class TouchEventDelegate(
 							view.vCenterStart!![event.getX(1)] = event.getY(1)
 						}
 					}
+					if (view.isZooming && view.isZoomEnabled && touchCount >= 3 &&
+						event.actionMasked == MotionEvent.ACTION_POINTER_UP
+					) {
+						// Three or more fingers and one lifted: the pinch pair (pointer indices 0 and 1) changes, so
+						// re-baseline on the two fingers that will occupy those slots, or scale/pan would jump.
+						var first = -1
+						var second = -1
+						for (i in 0 until touchCount) {
+							if (i == event.actionIndex) continue
+							if (first < 0) {
+								first = i
+							} else {
+								second = i
+								break
+							}
+						}
+						if (first >= 0 && second >= 0) {
+							view.scaleStart = view.scale
+							view.vDistStart = distance(
+								event.getX(first),
+								event.getX(second),
+								event.getY(first),
+								event.getY(second),
+							)
+							view.vTranslateStart!![vTranslate.x] = vTranslate.y
+							val centerX = (event.getX(first) + event.getX(second)) / 2
+							val centerY = (event.getY(first) + event.getY(second)) / 2
+							view.vCenterStart!![centerX] = centerY
+						}
+					}
 					if (touchCount < 3) {
 						// End zooming when only one touch point
 						view.isZooming = false

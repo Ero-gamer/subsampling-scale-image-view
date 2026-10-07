@@ -2,6 +2,7 @@
 #include <android/bitmap.h>
 #include <android/log.h>
 #include <turbojpeg.h>
+#include <cstdint>
 #include <cstdlib>
 #include <cstring>
 #include <cmath>
@@ -12,13 +13,13 @@
 
 // ── Helpers ───────────────────────────────────────────────────────────────────
 
-/** Create an ARGB_8888 Android Bitmap. */
-static jobject create_bitmap(JNIEnv *env, int width, int height) {
+/** Create an ARGB_8888 or RGB_565 Android Bitmap. */
+static jobject create_bitmap(JNIEnv *env, int width, int height, bool rgb565) {
     jclass  bmp_cls  = env->FindClass("android/graphics/Bitmap");
     jclass  cfg_cls  = env->FindClass("android/graphics/Bitmap$Config");
     if (!bmp_cls || !cfg_cls) return nullptr;
 
-    jfieldID argb_fid = env->GetStaticFieldID(cfg_cls, "ARGB_8888",
+    jfieldID argb_fid = env->GetStaticFieldID(cfg_cls, rgb565 ? "RGB_565" : "ARGB_8888",
                             "Landroid/graphics/Bitmap$Config;");
     if (!argb_fid) return nullptr;
     jobject argb_cfg = env->GetStaticObjectField(cfg_cls, argb_fid);
@@ -65,7 +66,9 @@ static tjscalingfactor pick_scale(int sample_size, int num_factors,
  *   sample_size        — SSIV tile sample size (1 = full res, 2 = half, 4 = quarter…)
  *   sRect_*            — requested tile rect in SOURCE image coordinates
  *
- * Returns an ARGB_8888 Bitmap covering exactly [sRect_left..sRect_right,
+ *   rgb565             — true: return an RGB_565 bitmap (half the memory, ordered-dithered)
+ *
+ * Returns an ARGB_8888 (or RGB_565) Bitmap covering exactly [sRect_left..sRect_right,
  * sRect_top..sRect_bottom] at (1/sample_size) scale, or null on any error.
  */
 extern "C"
@@ -76,7 +79,8 @@ Java_com_davemorrissey_labs_subscaleview_decoder_LiJpegTurboRegionDecoder_native
     jbyteArray jpeg_data,
     jint img_width, jint img_height,
     jint sample_size,
-    jint sRect_left, jint sRect_top, jint sRect_right, jint sRect_bottom)
+    jint sRect_left, jint sRect_top, jint sRect_right, jint sRect_bottom,
+    jboolean rgb565)
 {
     // ── 1. Lock JPEG bytes ────────────────────────────────────────────────────
     jsize  jpeg_size = env->GetArrayLength(jpeg_data);
@@ -201,26 +205,60 @@ Java_com_davemorrissey_labs_subscaleview_decoder_LiJpegTurboRegionDecoder_native
     if (inner_h < 1) inner_h = 1;
 
     // ── 7. Create Android Bitmap and copy cropped rows ────────────────────────
-    result = create_bitmap(env, inner_w, inner_h);
+    const bool to565 = rgb565 == JNI_TRUE;
+    result = create_bitmap(env, inner_w, inner_h, to565);
     if (!result) {
         LOGE("create_bitmap(%d, %d) failed", inner_w, inner_h);
         free(pixel_buf);
         return nullptr;
     }
 
+    AndroidBitmapInfo info;
+    if (AndroidBitmap_getInfo(env, result, &info) < 0 ||
+        info.width != (uint32_t)inner_w || info.height != (uint32_t)inner_h) {
+        LOGE("AndroidBitmap_getInfo failed or size mismatch");
+        free(pixel_buf);
+        return nullptr;
+    }
+
     void *bmp_pixels = nullptr;
-    if (AndroidBitmap_lockPixels(env, result, &bmp_pixels) < 0) {
+    if (AndroidBitmap_lockPixels(env, result, &bmp_pixels) < 0 || !bmp_pixels) {
         LOGE("AndroidBitmap_lockPixels failed");
         free(pixel_buf);
         return nullptr;
     }
 
-    uint8_t *dst      = (uint8_t *)bmp_pixels;
-    int      row_size = inner_w * 4;
-    for (int row = 0; row < inner_h; row++) {
-        const uint8_t *src = pixel_buf + ((inner_y + row) * out_w + inner_x) * 4;
-        memcpy(dst, src, row_size);
-        dst += row_size;
+    // Rows are `info.stride` bytes apart, which is not always width * bytes-per-pixel.
+    uint8_t *dst = (uint8_t *)bmp_pixels;
+    if (!to565) {
+        const size_t row_size = (size_t)inner_w * 4;
+        for (int row = 0; row < inner_h; row++) {
+            const uint8_t *src = pixel_buf + ((size_t)(inner_y + row) * out_w + inner_x) * 4;
+            memcpy(dst + (size_t)row * info.stride, src, row_size);
+        }
+    } else {
+        // 4x4 ordered (Bayer) dither keyed on ABSOLUTE scaled coordinates so adjacent tiles agree
+        // at their seams. Plain truncation to 5/6/5 bits would show visible banding in gradients.
+        static const uint8_t bayer[4][4] = {
+            { 0,  8,  2, 10}, {12,  4, 14,  6}, { 3, 11,  1,  9}, {15,  7, 13,  5}
+        };
+        const int abs_x = (int)(aligned_left * scale) + inner_x;
+        const int abs_y = (int)(aligned_top  * scale) + inner_y;
+        for (int row = 0; row < inner_h; row++) {
+            const uint8_t *src = pixel_buf + ((size_t)(inner_y + row) * out_w + inner_x) * 4;
+            uint16_t *out = (uint16_t *)(dst + (size_t)row * info.stride);
+            const uint8_t *brow = bayer[(abs_y + row) & 3];
+            for (int col = 0; col < inner_w; col++, src += 4) {
+                const int b = brow[(abs_x + col) & 3];
+                int r = src[0] + ((b * 8) >> 4);
+                int g = src[1] + ((b * 4) >> 4);
+                int bl = src[2] + ((b * 8) >> 4);
+                if (r > 255) r = 255;
+                if (g > 255) g = 255;
+                if (bl > 255) bl = 255;
+                out[col] = (uint16_t)(((r >> 3) << 11) | ((g >> 2) << 5) | (bl >> 3));
+            }
+        }
     }
 
     AndroidBitmap_unlockPixels(env, result);

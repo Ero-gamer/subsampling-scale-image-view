@@ -1,6 +1,7 @@
 package com.davemorrissey.labs.subscaleview
 
 import android.annotation.SuppressLint
+import android.content.ComponentCallbacks2
 import android.content.ContentResolver
 import android.content.Context
 import android.graphics.Bitmap
@@ -49,6 +50,7 @@ import com.davemorrissey.labs.subscaleview.internal.ScaleAndTranslate
 import com.davemorrissey.labs.subscaleview.internal.Tile
 import com.davemorrissey.labs.subscaleview.internal.TileMap
 import com.davemorrissey.labs.subscaleview.internal.SettledScaler
+import com.davemorrissey.labs.subscaleview.internal.TileDecodeDispatcher
 import com.davemorrissey.labs.subscaleview.internal.TouchEventDelegate
 import com.davemorrissey.labs.subscaleview.internal.createBitmapDownscaler
 import com.davemorrissey.labs.subscaleview.internal.createBitmapScaler
@@ -188,7 +190,29 @@ public open class SubsamplingScaleImageView @JvmOverloads constructor(
 	private var maxTileWidth: Int = TILE_SIZE_AUTO
 	private var maxTileHeight: Int = TILE_SIZE_AUTO
 
-	public var backgroundDispatcher: CoroutineDispatcher = Dispatchers.Default
+	public var backgroundDispatcher: CoroutineDispatcher = TileDecodeDispatcher.instance
+
+	/**
+	 * Upper bound on the pixel count of one decoded tile. Tiles are split further until they fit, so
+	 * a single decode never allocates more than roughly `maxTilePixels * bytesPerPixel`, whatever the
+	 * GL texture limit of the device is (on many devices that limit alone would allow a 50+ MB tile).
+	 * Set before [setImage]; a value <= 0 disables the cap.
+	 */
+	public var maxTilePixels: Int = DEFAULT_MAX_TILE_PIXELS
+
+	/**
+	 * Upper bound on the pixel count of the always-resident base layer. The base layer's sample size
+	 * is raised until it fits; sharper tiles for the visible area are streamed on top of it.
+	 * Set before [setImage]; a value <= 0 disables the cap.
+	 */
+	public var baseLayerMaxPixels: Int = DEFAULT_BASE_LAYER_MAX_PIXELS
+
+	/**
+	 * Picks the largest power-of-two sample size that still keeps the decoded tile at least as sharp as
+	 * the screen, instead of the more conservative default that oversamples up to 2x per axis (4x the
+	 * memory). Recommended on devices with little RAM. Set before [setImage].
+	 */
+	public var isTightSampling: Boolean = false
 
 	// Whether tiles should be loaded while gestures and animations are still in progress
 	public var isEagerLoadingEnabled: Boolean = true
@@ -568,6 +592,58 @@ public open class SubsamplingScaleImageView @JvmOverloads constructor(
 		debugTextPaint = null
 		debugLinePaint = null
 		tileBgPaint = null
+	}
+
+	/**
+	 * Re-evaluates which tiles are needed. Call when something outside this view changed what part of
+	 * it is on screen (see [computeTileWindow]) without this view being redrawn, e.g. its parent list
+	 * scrolled.
+	 */
+	public fun requestTileRefresh() {
+		if (isReadySent) {
+			refreshRequiredTiles(load = true)
+		}
+	}
+
+	/**
+	 * Releases decoded tiles in response to [android.content.ComponentCallbacks2.onTrimMemory].
+	 * Everything dropped is re-decoded on demand; the base layer is only dropped once the app is in
+	 * the background, where the next draw rebuilds it.
+	 */
+	public fun trimMemory(level: Int) {
+		val tiles = tileMap ?: return
+		when {
+			level >= ComponentCallbacks2.TRIM_MEMORY_MODERATE -> {
+				tiles.recycleAll()
+				tileMap = null
+				invalidate()
+			}
+
+			level >= ComponentCallbacks2.TRIM_MEMORY_UI_HIDDEN -> {
+				for (layer in tiles.values) {
+					for (tile in layer) {
+						if (tile.sampleSize != fullImageSampleSize) tile.recycle()
+					}
+				}
+			}
+
+			level >= ComponentCallbacks2.TRIM_MEMORY_RUNNING_LOW -> {
+				viewRectToSource(0f, 0f, width.toFloat(), height.toFloat(), strictSRect)
+				for (layer in tiles.values) {
+					for (tile in layer) {
+						if (tile.sampleSize != fullImageSampleSize && !tile.intersects(strictSRect)) tile.recycle()
+					}
+				}
+			}
+		}
+	}
+
+	override fun onWindowVisibilityChanged(visibility: Int) {
+		super.onWindowVisibilityChanged(visibility)
+		if (visibility == VISIBLE && isReadySent) {
+			refreshRequiredTiles(load = true)
+			invalidate()
+		}
 	}
 
 	@CheckResult
@@ -1095,10 +1171,21 @@ public open class SubsamplingScaleImageView @JvmOverloads constructor(
 		fitToBounds(true, satTemp!!)
 
 		fullImageSampleSize = calculateInSampleSize(satTemp!!.scale)
-		if (fullImageSampleSize > 1) {
+		if (fullImageSampleSize > 1 && !isTightSampling) {
 			fullImageSampleSize /= 2
 		}
-		if (fullImageSampleSize == 1 && sRegion == null && sWidth() < maxTileDimensions.x && sHeight() < maxTileDimensions.y) {
+		val basePixelCap = baseLayerMaxPixels
+		if (basePixelCap > 0) {
+			val totalPixels = sWidth().toLong() * sHeight()
+			while (fullImageSampleSize < MAX_SAMPLE_SIZE &&
+				totalPixels / (fullImageSampleSize.toLong() * fullImageSampleSize) > basePixelCap
+			) {
+				fullImageSampleSize *= 2
+			}
+		}
+		if (fullImageSampleSize == 1 && sRegion == null && sWidth() < maxTileDimensions.x && sHeight() < maxTileDimensions.y &&
+			(maxTilePixels <= 0 || sWidth().toLong() * sHeight() <= maxTilePixels)
+		) {
 			decoder?.recycle()
 			decoder = null
 			loadBitmap(uri!!, false)
@@ -1200,6 +1287,24 @@ public open class SubsamplingScaleImageView @JvmOverloads constructor(
 				yTiles += 1
 				sTileHeight = sHeight() / yTiles
 				subTileHeight = sTileHeight / sampleSize
+			}
+			val pixelCap = maxTilePixels
+			if (pixelCap > 0) {
+				while (subTileWidth.toLong() * subTileHeight > pixelCap) {
+					val canSplitHeight = sHeight() / (yTiles + 1) / sampleSize >= MIN_TILE_SIDE
+					val canSplitWidth = sWidth() / (xTiles + 1) / sampleSize >= MIN_TILE_SIDE
+					if (canSplitHeight && (subTileHeight >= subTileWidth || !canSplitWidth)) {
+						yTiles += 1
+						sTileHeight = sHeight() / yTiles
+						subTileHeight = sTileHeight / sampleSize
+					} else if (canSplitWidth) {
+						xTiles += 1
+						sTileWidth = sWidth() / xTiles
+						subTileWidth = sTileWidth / sampleSize
+					} else {
+						break
+					}
+				}
 			}
 			val tileGrid = ArrayList<Tile>(xTiles * yTiles)
 			for (x in 0 until xTiles) {
@@ -1372,33 +1477,94 @@ public open class SubsamplingScaleImageView @JvmOverloads constructor(
 		}
 	}
 
+	/**
+	 * The rectangle, in this view's own coordinates, inside which tiles are decoded. Defaults to the
+	 * view bounds. A host that scrolls this view inside a larger container (a webtoon list) overrides
+	 * it to be the visible part of the container plus a prefetch margin, so tiles of a view that is
+	 * mostly off-screen are not decoded eagerly.
+	 */
+	protected open fun computeTileWindow(out: Rect) {
+		out.set(0, 0, width, height)
+	}
+
+	/**
+	 * Extra margin, in view pixels, around [computeTileWindow] inside which an already decoded tile
+	 * is kept (not newly loaded). Hysteresis: stops tiles at the window edge from being evicted and
+	 * re-decoded on every small scroll.
+	 */
+	protected open val tileKeepSlop: Int
+		get() = 0
+
+	private val tileWindowRect = Rect()
+	private val strictSRect = RectF()
+	private val loadSRect = RectF()
+	private val keepSRect = RectF()
+
+	private fun viewRectToSource(
+		left: Float,
+		top: Float,
+		right: Float,
+		bottom: Float,
+		out: RectF,
+	) {
+		out.set(viewToSourceX(left), viewToSourceY(top), viewToSourceX(right), viewToSourceY(bottom))
+	}
+
 	@JvmSynthetic
 	internal fun refreshRequiredTiles(load: Boolean) {
-		if (decoder == null) {
-			return
-		}
+		val decoder = decoder ?: return
 		val tiles = tileMap?.values ?: return
 		val sampleSize = minOf(fullImageSampleSize, calculateInSampleSize(scale))
 
+		viewRectToSource(0f, 0f, width.toFloat(), height.toFloat(), strictSRect)
+		computeTileWindow(tileWindowRect)
+		val w = tileWindowRect
+		viewRectToSource(w.left.toFloat(), w.top.toFloat(), w.right.toFloat(), w.bottom.toFloat(), loadSRect)
+		val slop = tileKeepSlop.toFloat()
+		viewRectToSource(w.left - slop, w.top - slop, w.right + slop, w.bottom + slop, keepSRect)
+
+		// Two passes so that tiles on screen are queued ahead of prefetch tiles (the pool is FIFO).
 		for (value in tiles) {
 			for (tile in value) {
-				val isTileOutdated = !tile.isValid
-				if (tile.sampleSize < sampleSize || tile.sampleSize > sampleSize && tile.sampleSize != fullImageSampleSize) {
-					tile.recycle()
-				}
-				if (tile.sampleSize == sampleSize) {
-					if (tileVisible(tile)) {
-						tile.isVisible = true
-						if (!tile.isLoading && (isTileOutdated || tile.bitmap == null) && load) {
-							loadTile(decoder!!, tile)
-						}
-					} else if (tile.sampleSize != fullImageSampleSize) {
-						tile.recycle()
-					}
-				} else if (tile.sampleSize == fullImageSampleSize) {
-					tile.isVisible = true
+				refreshTile(tile, sampleSize)
+				if (load && tile.isVisible && tile.needsLoad(sampleSize)) {
+					loadTile(decoder, tile)
 				}
 			}
+		}
+		if (load) {
+			for (value in tiles) {
+				for (tile in value) {
+					if (!tile.isVisible && tile.needsLoad(sampleSize) && tile.intersects(loadSRect)) {
+						loadTile(decoder, tile)
+					}
+				}
+			}
+		}
+	}
+
+	/** Updates the eviction / visibility state of [tile] for the current target [sampleSize]. */
+	private fun refreshTile(
+		tile: Tile,
+		sampleSize: Int,
+	) {
+		if (tile.sampleSize < sampleSize || (tile.sampleSize > sampleSize && tile.sampleSize != fullImageSampleSize)) {
+			tile.recycle()
+		}
+		if (tile.sampleSize == sampleSize) {
+			if (tile.sampleSize == fullImageSampleSize) {
+				// The base layer is always resident; it is never windowed or evicted.
+				tile.isVisible = true
+			} else if (tile.intersects(strictSRect)) {
+				tile.isVisible = true
+			} else {
+				tile.isVisible = false
+				if (!tile.intersects(keepSRect)) {
+					tile.recycle()
+				}
+			}
+		} else if (tile.sampleSize == fullImageSampleSize) {
+			tile.isVisible = true
 		}
 	}
 
@@ -1420,15 +1586,6 @@ public open class SubsamplingScaleImageView @JvmOverloads constructor(
 		}
 	}
 
-	private fun tileVisible(tile: Tile): Boolean {
-		val sVisLeft = viewToSourceX(0f)
-		val sVisRight = viewToSourceX(width.toFloat())
-		val sVisTop = viewToSourceY(0f)
-		val sVisBottom = viewToSourceY(height.toFloat())
-		val sRect = tile.sRect
-		return !(sVisLeft > sRect.right || sRect.left > sVisRight || sVisTop > sRect.bottom || sRect.top > sVisBottom)
-	}
-
 	private fun calculateInSampleSize(scale: Float): Int {
 		@Suppress("NAME_SHADOWING")
 		var scale = scale
@@ -1443,6 +1600,14 @@ public open class SubsamplingScaleImageView @JvmOverloads constructor(
 		var inSampleSize = 1
 		if (reqWidth == 0 || reqHeight == 0) {
 			return 32
+		}
+		if (isTightSampling) {
+			val ratio = minOf(sHeight().toFloat() / reqHeight, sWidth().toFloat() / reqWidth)
+			var tight = 1
+			while (tight < MAX_SAMPLE_SIZE && tight * 2 <= ratio) {
+				tight *= 2
+			}
+			return tight
 		}
 		if (sHeight() > reqHeight || sWidth() > reqWidth) {
 			val heightRatio = (sHeight().toFloat() / reqHeight.toFloat()).roundToInt()
@@ -1588,26 +1753,32 @@ public open class SubsamplingScaleImageView @JvmOverloads constructor(
 
 	private fun loadTile(decoder: ImageRegionDecoder, tile: Tile) {
 		tile.isLoading = true
-		// Capture generation and downSampling at launch. If either changes while this
-		// coroutine is running (because the user leaves the page or changes zoom level),
-		// the decoded bitmap is stale and must be discarded rather than stored.
+		// Capture generation, downSampling and the tile epoch at launch. If the generation or
+		// downSampling changes while this coroutine runs, the bitmap is stale and is discarded; if the
+		// tile was evicted (epoch bumped by Tile.recycle) it is discarded without touching the tile's
+		// flags, which already belong to a newer load.
 		val capturedGeneration = tileGeneration.get()
 		val capturedDownSampling = downSampling
+		val capturedEpoch = tile.epoch
 		coroutineScope.launch {
 			try {
-				val decodedBitmap: Bitmap? = if (decoder.isReady && tile.isVisible) {
+				val decodedBitmap: Bitmap? = if (decoder.isReady) {
 					runInterruptible(backgroundDispatcher) {
+						if (tile.epoch != capturedEpoch) return@runInterruptible null
 						decoderLock.readLock().lock()
 						try {
-							if (decoder.isReady) {
+							if (decoder.isReady && tile.epoch == capturedEpoch) {
 								// Compute the file-coordinate rect for this tile, accounting
 								// for image rotation. Capture downSampling from the closure —
 								// reading it at decode time would race with applyDownSampling().
 								fileSRect(tile.sRect, tile.fileSRect)
 								sRegion?.let { tile.fileSRect.offset(it.left, it.top) }
-								decoder.decodeRegion(tile.fileSRect, tile.sampleSize * capturedDownSampling)
+								decoder.decodeRegion(tile.fileSRect, tile.sampleSize * capturedDownSampling).also {
+									// Upload the texture now, on this thread, for tiles that are on screen, instead of on
+									// the render thread during the first frame that draws them (a visible hitch).
+									if (tile.isVisible) it.prepareToDraw()
+								}
 							} else {
-								tile.isLoading = false
 								null
 							}
 						} finally {
@@ -1615,41 +1786,35 @@ public open class SubsamplingScaleImageView @JvmOverloads constructor(
 						}
 					}
 				} else {
-					tile.isLoading = false
 					null
 				}
 
-				// Back on the main thread: check whether the generation is still current.
+				if (tile.epoch != capturedEpoch) {
+					decodedBitmap?.recycle()
+					return@launch
+				}
 				if (tileGeneration.get() == capturedGeneration) {
-					// Generation matches — store the bitmap and trigger a redraw.
 					// Capture the old bitmap BEFORE overwriting, then recycle it AFTER
-					// onTileLoaded() so the main thread's current draw frame can finish
-					// safely. tile.bitmap is @Volatile so the assignment is immediately
-					// visible to the main thread.
+					// onTileLoaded() so the current draw frame can finish safely.
 					val oldBitmap = tile.bitmap
-					tile.bitmap = decodedBitmap   // visible to onDraw via @Volatile
+					tile.bitmap = decodedBitmap
 					tile.isValid = true
 					tile.isLoading = false
 					onTileLoaded()
-					// Recycle old bitmap after the new one is live on the main thread.
 					oldBitmap?.recycle()
 				} else {
-					// Generation changed while we were decoding: the bitmap is stale
-					// (decoded at the wrong downSampling level). Discard it.
+					// Decoded at a stale downSampling level: discard, requeue on the next refresh and
+					// redraw so the view re-evaluates its tile state instead of staying black.
 					decodedBitmap?.recycle()
 					tile.isLoading = false
-					// Mark as invalid so refreshRequiredTiles() requeues it at the correct
-					// resolution on the next frame. Also trigger a redraw so the view
-					// re-evaluates its tile state — without this, the view can stay black
-					// if no other event fires another invalidate().
 					tile.isValid = false
 					invalidate()
 				}
 			} catch (e: CancellationException) {
-				tile.isLoading = false
+				if (tile.epoch == capturedEpoch) tile.isLoading = false
 				throw e
 			} catch (error: Throwable) {
-				tile.isLoading = false
+				if (tile.epoch == capturedEpoch) tile.isLoading = false
 				onImageEventListeners.onTileLoadError(error)
 			}
 		}
@@ -2175,6 +2340,18 @@ public open class SubsamplingScaleImageView @JvmOverloads constructor(
 	public companion object {
 
 		public const val TILE_SIZE_AUTO: Int = Integer.MAX_VALUE
+
+		/** Default for [maxTilePixels]: 3 MP, i.e. 12 MB per ARGB_8888 tile. */
+		internal const val DEFAULT_MAX_TILE_PIXELS = 3_145_728
+
+		/** Default for [baseLayerMaxPixels]. */
+		internal const val DEFAULT_BASE_LAYER_MAX_PIXELS = 4_000_000
+
+		/** Largest sample size ever chosen; keeps the tile-grid loops bounded. */
+		internal const val MAX_SAMPLE_SIZE = 64
+
+		/** Tiles are never split below this many decoded pixels per side by [maxTilePixels]. */
+		private const val MIN_TILE_SIDE = 128
 		internal const val TAG = "SSIV"
 
 		// A custom scaler is only used when every source pixel covers clearly more than one
