@@ -62,6 +62,14 @@ internal class Tile {
     @Volatile
     var epoch: Int = 0
 
+    /** Last time (uptime ms) this tile was on screen or inside the keep window; the eviction order. */
+    @JvmField
+    var lastUsed: Long = 0L
+
+    /** Memory held by [bitmap], 0 when there is none. */
+    val byteCount: Int
+        get() = bitmap?.allocationByteCount ?: 0
+
     @JvmField
     var sRect: Rect = Rect()
 

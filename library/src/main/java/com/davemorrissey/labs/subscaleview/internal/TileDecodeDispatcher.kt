@@ -3,6 +3,7 @@ package com.davemorrissey.labs.subscaleview.internal
 import android.os.Process
 import kotlinx.coroutines.CoroutineDispatcher
 import kotlinx.coroutines.asCoroutineDispatcher
+import java.util.concurrent.Executor
 import java.util.concurrent.LinkedBlockingQueue
 import java.util.concurrent.ThreadFactory
 import java.util.concurrent.ThreadPoolExecutor
@@ -32,6 +33,22 @@ internal object TileDecodeDispatcher {
     private const val SMALL_HEAP_BYTES = 256L * 1024 * 1024
     private const val MAX_THREADS = 3
     private const val KEEP_ALIVE_SECONDS = 20L
+
+    /**
+     * One idle-timeout thread for releasing decoders. A decoder may only be released once no decode
+     * is running on it, which can take a while; doing that wait on the main thread froze scrolling
+     * every time a page was recycled mid-decode.
+     */
+    val cleanup: Executor by lazy(LazyThreadSafetyMode.PUBLICATION) {
+        ThreadPoolExecutor(
+            1,
+            1,
+            KEEP_ALIVE_SECONDS,
+            TimeUnit.SECONDS,
+            LinkedBlockingQueue(),
+            ThreadFactory { task -> Thread(task, "ssiv-cleanup").apply { isDaemon = true } },
+        ).apply { allowCoreThreadTimeOut(true) }
+    }
 
     val instance: CoroutineDispatcher by lazy(LazyThreadSafetyMode.PUBLICATION) {
         val cores = Runtime.getRuntime().availableProcessors()

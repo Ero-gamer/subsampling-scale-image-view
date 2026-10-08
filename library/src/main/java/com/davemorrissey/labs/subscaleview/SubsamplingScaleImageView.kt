@@ -16,6 +16,7 @@ import android.graphics.Rect
 import android.graphics.RectF
 import android.net.Uri
 import android.os.Build
+import android.os.SystemClock
 import android.util.AttributeSet
 import android.util.Log
 import android.view.GestureDetector
@@ -51,6 +52,7 @@ import com.davemorrissey.labs.subscaleview.internal.Tile
 import com.davemorrissey.labs.subscaleview.internal.TileMap
 import com.davemorrissey.labs.subscaleview.internal.SettledScaler
 import com.davemorrissey.labs.subscaleview.internal.TileDecodeDispatcher
+import com.davemorrissey.labs.subscaleview.internal.TileMemory
 import com.davemorrissey.labs.subscaleview.internal.TouchEventDelegate
 import com.davemorrissey.labs.subscaleview.internal.createBitmapDownscaler
 import com.davemorrissey.labs.subscaleview.internal.createBitmapScaler
@@ -237,6 +239,13 @@ public open class SubsamplingScaleImageView @JvmOverloads constructor(
 
 	// Double tap zoom behaviour
 	public var doubleTapZoomScale: Float = 1F
+
+	/**
+	 * Ascending zoom levels a double tap steps through (each one above the current scale), then back to
+	 * the minimum scale. When set it replaces [doubleTapZoomScale]; unlike re-priming that value after
+	 * every tap it cannot be raced by a quick second tap.
+	 */
+	public var doubleTapZoomStages: FloatArray? = null
 	public var doubleTapZoomStyle: Int = ZOOM_FOCUS_FIXED
 		set(value) {
 			require(value in VALID_ZOOM_STYLES)
@@ -485,6 +494,7 @@ public open class SubsamplingScaleImageView @JvmOverloads constructor(
 		// screen you get maxScale=2. At 80dpi you get maxScale=4, giving full 1:1 reading
 		// zoom on typical phone screens. On lower-DPI devices like Android TV (96dpi) the
 		// old value of 160 meant maxScale<1 — impossible to zoom IN at all.
+		TileMemory.register(this)
 		setMinimumDpi(80)
 		setDoubleTapZoomDpi(80)
 		setMinimumTileDpi(320)
@@ -1437,12 +1447,22 @@ public open class SubsamplingScaleImageView @JvmOverloads constructor(
 			// BUG 2 FIX: increment generation so any in-flight tile loads are discarded.
 			tileGeneration.incrementAndGet()
 			uri = null
-			decoderLock.writeLock().lock()
-			try {
-				decoder?.recycle()
-				decoder = null
-			} finally {
-				decoderLock.writeLock().unlock()
+			// Release the decoder off the main thread: it can only be released once no decode is running
+			// on it, and waiting for that here froze scrolling whenever a page was recycled mid-decode.
+			val oldDecoder = decoder
+			decoder = null
+			if (oldDecoder != null) {
+				val lock = decoderLock
+				TileDecodeDispatcher.cleanup.execute {
+					lock.writeLock().lock()
+					try {
+						oldDecoder.recycle()
+					} catch (_: Exception) {
+						// nothing left to release
+					} finally {
+						lock.writeLock().unlock()
+					}
+				}
 			}
 			bitmap?.let {
 				if (!bitmapIsCached) {
@@ -1522,23 +1542,61 @@ public open class SubsamplingScaleImageView @JvmOverloads constructor(
 		viewRectToSource(w.left.toFloat(), w.top.toFloat(), w.right.toFloat(), w.bottom.toFloat(), loadSRect)
 		val slop = tileKeepSlop.toFloat()
 		viewRectToSource(w.left - slop, w.top - slop, w.right + slop, w.bottom + slop, keepSRect)
+		val now = SystemClock.uptimeMillis()
+		// While the host is scrolling too fast to read, only the base layer is (re)loaded: detail tiles
+		// for content that is flying past would be decoded, drawn for a frame or two and thrown away.
+		val deferDetail = load && isTileLoadingDeferred()
 
 		// Two passes so that tiles on screen are queued ahead of prefetch tiles (the pool is FIFO).
 		for (value in tiles) {
 			for (tile in value) {
-				refreshTile(tile, sampleSize)
-				if (load && tile.isVisible && tile.needsLoad(sampleSize)) {
+				refreshTile(tile, sampleSize, now)
+				if (load && tile.isVisible && tile.needsLoad(sampleSize) &&
+					(!deferDetail || tile.sampleSize == fullImageSampleSize)
+				) {
 					loadTile(decoder, tile)
 				}
 			}
 		}
-		if (load) {
+		if (load && !deferDetail) {
+			TileMemory.beginPass()
+			val budget = tileBudgetBytes
 			for (value in tiles) {
 				for (tile in value) {
-					if (!tile.isVisible && tile.needsLoad(sampleSize) && tile.intersects(loadSRect)) {
+					if (!tile.isVisible && tile.needsLoad(sampleSize) && tile.intersects(loadSRect) &&
+						TileMemory.tryReserve(estimatedBytes(tile), budget)
+					) {
 						loadTile(decoder, tile)
 					}
 				}
+			}
+		}
+	}
+
+	/** Whether decoding of detail tiles is postponed right now (see [refreshRequiredTiles]). */
+	protected open fun isTileLoadingDeferred(): Boolean = false
+
+	private fun estimatedBytes(tile: Tile): Long {
+		val step = (tile.sampleSize * downSampling).coerceAtLeast(1)
+		return tile.sRect.width().toLong() / step * (tile.sRect.height().toLong() / step) * BYTES_PER_PIXEL
+	}
+
+	/** Memory held by this view's tile bitmaps. */
+	internal fun residentTileBytes(): Long {
+		var total = 0L
+		val map = tileMap ?: return 0L
+		for (layer in map.values) {
+			for (tile in layer) total += tile.byteCount
+		}
+		return total
+	}
+
+	/** Adds the tiles that may be evicted to free memory: decoded, off screen, not the base layer. */
+	internal fun collectEvictableTiles(out: MutableList<Tile>) {
+		val map = tileMap ?: return
+		for (layer in map.values) {
+			for (tile in layer) {
+				if (tile.bitmap != null && !tile.isVisible && tile.sampleSize != fullImageSampleSize) out.add(tile)
 			}
 		}
 	}
@@ -1547,6 +1605,7 @@ public open class SubsamplingScaleImageView @JvmOverloads constructor(
 	private fun refreshTile(
 		tile: Tile,
 		sampleSize: Int,
+		now: Long,
 	) {
 		if (tile.sampleSize < sampleSize || (tile.sampleSize > sampleSize && tile.sampleSize != fullImageSampleSize)) {
 			tile.recycle()
@@ -1566,6 +1625,7 @@ public open class SubsamplingScaleImageView @JvmOverloads constructor(
 		} else if (tile.sampleSize == fullImageSampleSize) {
 			tile.isVisible = true
 		}
+		if (tile.isVisible || tile.intersects(keepSRect)) tile.lastUsed = now
 	}
 
 	private fun invalidateTiles() {
@@ -1761,33 +1821,34 @@ public open class SubsamplingScaleImageView @JvmOverloads constructor(
 		val capturedDownSampling = downSampling
 		val capturedEpoch = tile.epoch
 		coroutineScope.launch {
+			// Written by the decode thread. If this coroutine is cancelled while a decode is running (a page
+			// recycled mid-decode) the decode still completes and its result would otherwise be dropped
+			// without being recycled, i.e. held in native memory until a GC happens to run.
+			var produced: Bitmap? = null
 			try {
-				val decodedBitmap: Bitmap? = if (decoder.isReady) {
+				if (decoder.isReady) {
 					runInterruptible(backgroundDispatcher) {
-						if (tile.epoch != capturedEpoch) return@runInterruptible null
+						if (tile.epoch != capturedEpoch) return@runInterruptible
 						decoderLock.readLock().lock()
 						try {
 							if (decoder.isReady && tile.epoch == capturedEpoch) {
-								// Compute the file-coordinate rect for this tile, accounting
-								// for image rotation. Capture downSampling from the closure —
-								// reading it at decode time would race with applyDownSampling().
+								// File-coordinate rect for this tile, accounting for image rotation. downSampling is captured
+								// in the closure: reading it at decode time would race with applyDownSampling().
 								fileSRect(tile.sRect, tile.fileSRect)
 								sRegion?.let { tile.fileSRect.offset(it.left, it.top) }
-								decoder.decodeRegion(tile.fileSRect, tile.sampleSize * capturedDownSampling).also {
-									// Upload the texture now, on this thread, for tiles that are on screen, instead of on
-									// the render thread during the first frame that draws them (a visible hitch).
+								produced = decoder.decodeRegion(tile.fileSRect, tile.sampleSize * capturedDownSampling).also {
+									// Upload the texture now, on this thread, for tiles that are on screen, instead of on the
+									// render thread during the first frame that draws them (a visible hitch).
 									if (tile.isVisible) it.prepareToDraw()
 								}
-							} else {
-								null
 							}
 						} finally {
 							decoderLock.readLock().unlock()
 						}
 					}
-				} else {
-					null
 				}
+				val decodedBitmap: Bitmap? = produced
+				produced = null
 
 				if (tile.epoch != capturedEpoch) {
 					decodedBitmap?.recycle()
@@ -1802,6 +1863,7 @@ public open class SubsamplingScaleImageView @JvmOverloads constructor(
 					tile.isLoading = false
 					onTileLoaded()
 					oldBitmap?.recycle()
+					TileMemory.enforce(tileBudgetBytes)
 				} else {
 					// Decoded at a stale downSampling level: discard, requeue on the next refresh and
 					// redraw so the view re-evaluates its tile state instead of staying black.
@@ -1811,9 +1873,11 @@ public open class SubsamplingScaleImageView @JvmOverloads constructor(
 					invalidate()
 				}
 			} catch (e: CancellationException) {
+				produced?.recycle()
 				if (tile.epoch == capturedEpoch) tile.isLoading = false
 				throw e
 			} catch (error: Throwable) {
+				produced?.recycle()
 				if (tile.epoch == capturedEpoch) tile.isLoading = false
 				onImageEventListeners.onTileLoadError(error)
 			}
@@ -2032,9 +2096,26 @@ public open class SubsamplingScaleImageView @JvmOverloads constructor(
 				sCenter.y = sHeight() / 2f
 			}
 		}
-		val doubleTapZoomScale = doubleTapZoomScale.coerceAtMost(maxScale)
-		val zoomIn = scale <= doubleTapZoomScale * 0.9 || scale == _minScale
-		val targetScale = if (zoomIn) doubleTapZoomScale else minScale()
+		val stages = doubleTapZoomStages
+		val zoomIn: Boolean
+		val targetScale: Float
+		if (stages != null && stages.isNotEmpty()) {
+			// Next stage above the current scale; none left means back to the minimum.
+			var next = 0f
+			for (stage in stages) {
+				val level = stage.coerceIn(minScale(), maxScale)
+				if (level > scale * STAGE_MARGIN) {
+					next = level
+					break
+				}
+			}
+			zoomIn = next > 0f
+			targetScale = if (zoomIn) next else minScale()
+		} else {
+			val doubleTapZoomScale = doubleTapZoomScale.coerceAtMost(maxScale)
+			zoomIn = scale <= doubleTapZoomScale * 0.9 || scale == _minScale
+			targetScale = if (zoomIn) doubleTapZoomScale else minScale()
+		}
 		when {
 			doubleTapZoomStyle == ZOOM_FOCUS_CENTER_IMMEDIATE -> {
 				setScaleAndCenter(targetScale, sCenter)
@@ -2343,6 +2424,19 @@ public open class SubsamplingScaleImageView @JvmOverloads constructor(
 
 		/** Default for [maxTilePixels]: 3 MP, i.e. 12 MB per ARGB_8888 tile. */
 		internal const val DEFAULT_MAX_TILE_PIXELS = 3_145_728
+
+		/** A stage counts as reached once the scale is within this factor of it. */
+		private const val STAGE_MARGIN = 1.03f
+
+		private const val BYTES_PER_PIXEL = 4L
+
+		/**
+		 * Upper bound, in bytes, for the decoded tile bitmaps of ALL views together that are not on screen
+		 * (prefetch and keep zones). Tiles on screen and base layers are exempt. Unlimited by default.
+		 */
+		@Volatile
+		@JvmStatic
+		public var tileBudgetBytes: Long = Long.MAX_VALUE
 
 		/** Default for [baseLayerMaxPixels]. */
 		internal const val DEFAULT_BASE_LAYER_MAX_PIXELS = 4_000_000
