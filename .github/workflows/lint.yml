@@ -1,0 +1,48 @@
+name: Lint check (manual, report only)
+
+# Manual only and report-only: it never changes files. Use ktlint-fix.yml / spotless-fix.yml for the
+# verified layout-only fixes and detekt.yml for the baseline.
+# Uses the same engines as the app's Spotless + detekt setup (ktlint 1.8.0, detekt 1.23.8) as
+# standalone CLIs, so the library's Gradle/JitPack build is untouched.
+on:
+  workflow_dispatch:
+
+env:
+  KTLINT_VERSION: "1.8.0"
+  DETEKT_VERSION: "1.23.8"
+
+jobs:
+  lint:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v7
+        with:
+          fetch-depth: 0
+
+      - name: Set up JDK 21
+        uses: actions/setup-java@v6.0.1
+        with:
+          java-version: '21'
+          distribution: 'temurin'
+
+      - name: Install ktlint and detekt CLIs
+        run: |
+          mkdir -p "$RUNNER_TEMP/tools" && cd "$RUNNER_TEMP/tools"
+          curl -fsSL -o ktlint "https://github.com/pinterest/ktlint/releases/download/${KTLINT_VERSION}/ktlint"
+          chmod +x ktlint
+          curl -fsSL -o detekt.zip "https://github.com/detekt/detekt/releases/download/v${DETEKT_VERSION}/detekt-cli-${DETEKT_VERSION}.zip"
+          unzip -q detekt.zip
+          echo "$RUNNER_TEMP/tools" >> "$GITHUB_PATH"
+          echo "$RUNNER_TEMP/tools/detekt-cli-${DETEKT_VERSION}/bin" >> "$GITHUB_PATH"
+
+      - name: ktlint check
+        run: ktlint 'library/src/**/*.kt'
+
+      - name: detekt
+        run: >
+          detekt-cli
+          --config config/detekt/detekt.yml
+          --build-upon-default-config
+          --baseline config/detekt/baseline.xml
+          --input library/src/main/java
