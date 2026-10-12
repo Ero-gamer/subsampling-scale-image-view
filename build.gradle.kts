@@ -19,7 +19,7 @@ buildscript {
         // 8.13.2 is the latest stable patch of the well-supported 8.x line, so it's the safer
         // "latest safe/compatible" pick until this module's build script is fully migrated
         // and can be verified against AGP 9.x.
-        classpath("com.android.tools.build:gradle:8.13.2")
+        classpath("com.android.tools.build:gradle:9.4.1")
         // Kept in sync with the kotlin-stdlib version declared in library/build.gradle.kts.
         // Kotlin 2.4.x supports AGP 8.5.2+ and Gradle 7.6.3-9.7.0.
         classpath("org.jetbrains.kotlin:kotlin-gradle-plugin:2.4.21")
