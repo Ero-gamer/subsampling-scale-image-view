@@ -188,6 +188,8 @@ public class GpuFilteringDecoder(
 
 	override val isReady: Boolean get() = inner.isReady
 
+	override val isRegionDecodeCheap: Boolean get() = inner.isRegionDecodeCheap
+
 	override fun recycle() {
 		inner.recycle()
 		// Do NOT call renderer.release() here — the renderer is shared across multiple

@@ -63,6 +63,8 @@ android {
                 // armeabi-v7a: 32-bit ARM fallback
                 // x86_64: emulator support
                 abiFilters += listOf("arm64-v8a", "armeabi-v7a", "x86_64")
+                // Lets NDK r27+ produce 16 KB page-size aligned libraries (ignored by older NDKs).
+                arguments += "-DANDROID_SUPPORT_FLEXIBLE_PAGE_SIZES=ON"
             }
         }
     }
@@ -79,7 +81,7 @@ kotlin {
 val javadocs by configurations.creating
 
 dependencies {
-    implementation("org.jetbrains.kotlin:kotlin-stdlib:2.3.20")
+    implementation("org.jetbrains.kotlin:kotlin-stdlib:2.4.21")
     implementation("androidx.customview:customview:1.2.0")
     javadocs("androidx.annotation:annotation:1.10.0")
     javadocs("androidx.exifinterface:exifinterface:1.4.2")

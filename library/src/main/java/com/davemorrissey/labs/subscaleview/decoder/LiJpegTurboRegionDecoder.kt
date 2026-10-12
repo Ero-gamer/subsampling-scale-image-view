@@ -10,6 +10,7 @@ import android.graphics.Point
 import android.graphics.Rect
 import android.net.Uri
 import android.os.Build
+import android.os.ParcelFileDescriptor
 import android.text.TextUtils
 import androidx.annotation.WorkerThread
 import com.davemorrissey.labs.subscaleview.internal.URI_PATH_ASSET
@@ -18,400 +19,400 @@ import com.davemorrissey.labs.subscaleview.internal.URI_SCHEME_FILE
 import com.davemorrissey.labs.subscaleview.internal.URI_SCHEME_RES
 import com.davemorrissey.labs.subscaleview.internal.URI_SCHEME_ZIP
 import java.io.File
+import java.io.IOException
 import java.io.InputStream
-import java.util.concurrent.locks.ReadWriteLock
+import java.util.UUID
 import java.util.concurrent.locks.ReentrantReadWriteLock
 import java.util.zip.ZipFile
+import kotlin.concurrent.read
+import kotlin.concurrent.write
 
 /**
- * [ImageRegionDecoder] backed by libjpeg-turbo for all JPEG images, and
- * [BitmapRegionDecoder] (Skia) for everything else (WebP, PNG, AVIF, etc.).
+ * [ImageRegionDecoder] backed by libjpeg-turbo for JPEG images and [BitmapRegionDecoder] (Skia) for
+ * everything else (WebP, PNG, AVIF, ...), and for the rare JPEGs the native path cannot handle.
  *
- * libjpeg-turbo is faster than Android's built-in JPEG decoder, uses less
- * memory (pure software DCT, no HAL round-trip), and avoids the hardware
- * chroma-upsampler bug present on some Qualcomm/MediaTek devices that produces
- * repeating coloured tint bands on tall strip images.
+ * The JPEG path never copies the image into the Java heap: the file (or the STORED entry of a CBZ) is
+ * memory-mapped read-only and a tile decode only touches the pages of the MCU rows it needs. Deflated
+ * CBZ entries and content:// images are first copied once to a small bounded cache directory.
+ * Dimensions come from the JPEG header itself, so no [BitmapRegionDecoder] is created for JPEGs unless
+ * a fallback is actually needed (sample size above 8, unsupported variants, native errors).
  *
- * JPEG detection uses magic bytes (FF D8 FF), not the URI extension — so it
- * works correctly for content:// and file+zip:// URIs (CBZ manga archives)
- * where the path has no .jpg extension visible to the caller.
- *
- * Supports all URI schemes used by SSIV: content://, file://, file+zip://
- * (CBZ/ZIP archives), and android.resource://.
+ * JPEG detection uses the magic bytes (FF D8 FF), not the URI extension.
  */
 public class LiJpegTurboRegionDecoder(
-    private val quality: BitmapQuality = BitmapQuality.STANDARD,
+	private val quality: BitmapQuality = BitmapQuality.STANDARD,
 ) : ImageRegionDecoder {
 
-    private val decoderLock: ReadWriteLock = ReentrantReadWriteLock(true)
-    private var decoder: BitmapRegionDecoder? = null
+	// Read lock: decoding. Write lock: init publishing results / recycle (waits for running decodes).
+	private val lock = ReentrantReadWriteLock(true)
+	private val skiaLock = Any()
 
-    // True when the source image is a JPEG — detected via magic bytes in init().
-    private var isJpeg = false
+	@Volatile
+	private var handle = 0L
 
-    // Complete compressed JPEG bytes, read once in init() and kept for tile decodes.
-    // null when isJpeg is false (non-JPEG images never need this).
-    private var jpegBytes: ByteArray? = null
+	@Volatile
+	private var skia: BitmapRegionDecoder? = null
 
-    // Source image dimensions needed by the native crop math.
-    private var imageWidth:  Int = 0
-    private var imageHeight: Int = 0
+	/** Set when the Skia path serves a format that cannot decode a region cheaply (not a JPEG). */
+	@Volatile
+	private var costlyRegions = false
 
-    // URI string key for this decoder's cache entry. Used only to null out local
-    // state on recycle() — the shared byteCache entry itself is intentionally NOT
-    // evicted here (see recycle() for why).
-    private var sourceUriKey: String? = null
+	@Volatile
+	private var recycled = false
 
-    // ── init ──────────────────────────────────────────────────────────────────
+	private var appContext: Context? = null
+	private var sourceUri: Uri? = null
 
-    @SuppressLint("DiscouragedApi")
-    @WorkerThread
-    override fun init(context: Context, uri: Uri): Point {
-        val brd = openBitmapRegionDecoder(context, uri)
-        decoderLock.writeLock().lock()
-        try {
-            decoder     = brd
-            imageWidth  = brd.width
-            imageHeight = brd.height
-            val key = uri.toString()
-            sourceUriKey = key
+	// Private copy of a content:// image (deleted on recycle). Cache-dir copies are shared and trimmed instead.
+	private var privateTemp: File? = null
 
-            // Check the process-level SoftReference cache before reading from disk.
-            //
-            // reloadImage() — triggered by filter changes — creates a new decoder
-            // instance for the same URI. Without caching, every init() allocates a
-            // ByteArrayOutputStream that grows to file size (~1–5 MB) and then copies
-            // the entire buffer via Arrays.copyOf (the toByteArray() call in the stack
-            // trace). On a 2 GB device with only ~200 KB free this causes OOM.
-            //
-            // SoftReference allows GC to reclaim bytes under memory pressure without
-            // any explicit coordination. recycle() does NOT evict this entry (see the
-            // comment there for why) — only already-cleared entries get pruned, and
-            // only occasionally, so the map stays small without ever invalidating a
-            // still-useful cache hit.
-            val cached = byteCache[key]?.get()
-            if (cached != null) {
-                jpegBytes = cached
-                isJpeg    = true
-            } else {
-                val header = readFirstBytes(context, uri, 3)
-                if (header != null && isJpegMagic(header)) {
-                    val bytes = readBytes(context, uri)
-                    if (bytes != null) {
-                        jpegBytes = bytes
-                        isJpeg    = true
-                        byteCache[key] = java.lang.ref.SoftReference(bytes)
-                    }
-                }
-            }
-        } finally {
-            decoderLock.writeLock().unlock()
-        }
-        return Point(brd.width, brd.height)
-    }
+	@SuppressLint("DiscouragedApi")
+	@WorkerThread
+	override fun init(context: Context, uri: Uri): Point {
+		val ctx = context.applicationContext ?: context
+		var temp: File? = null
+		var opened = 0L
+		var size: IntArray? = null
+		try {
+			val source = resolveNativeSource(ctx, uri)
+			if (source != null) {
+				temp = source.privateTemp
+				opened = openNative(source)
+				size = if (opened != 0L) JpegNative.nativeInfo(opened) else null
+				if (size == null && opened != 0L) {
+					JpegNative.nativeClose(opened)
+					opened = 0L
+				}
+			}
+		} catch (_: Exception) {
+			// Anything unexpected on the fast path: use the Skia path below.
+			if (opened != 0L) JpegNative.nativeClose(opened)
+			opened = 0L
+			size = null
+		}
 
-    // ── decodeRegion ──────────────────────────────────────────────────────────
+		if (opened != 0L && size != null) {
+			lock.write {
+				if (recycled) {
+					JpegNative.nativeClose(opened)
+					temp?.delete()
+					error("Decoder recycled")
+				}
+				appContext = ctx
+				sourceUri = uri
+				privateTemp = temp
+				handle = opened
+			}
+			return Point(size[0], size[1])
+		}
+		temp?.delete()
+		val nonJpeg = !isLikelyJpeg(uri)
 
-    @WorkerThread
-    override fun decodeRegion(sRect: Rect, sampleSize: Int): Bitmap {
-        // libjpeg-turbo path for all JPEG images at all zoom levels.
-        if (isJpeg) {
-            val bytes = jpegBytes
-            if (bytes != null) {
-                val bmp = nativeDecodeRegion(
-                    bytes,
-                    imageWidth, imageHeight,
-                    sampleSize.coerceAtLeast(1),
-                    sRect.left, sRect.top, sRect.right, sRect.bottom,
-                    quality.toBitmapConfig() == Bitmap.Config.RGB_565,
-                )
-                if (bmp != null) return bmp
-                // Native decode failed — fall through to BitmapRegionDecoder.
-            }
-        }
+		val brd = openBitmapRegionDecoder(ctx, uri)
+		lock.write {
+			if (recycled) {
+				brd.recycle()
+				error("Decoder recycled")
+			}
+			appContext = ctx
+			sourceUri = uri
+			skia = brd
+			costlyRegions = nonJpeg
+		}
+		return Point(brd.width, brd.height)
+	}
 
-        // BitmapRegionDecoder path: non-JPEG images and native fallback.
-        decoderLock.readLock().lock()
-        return try {
-            val dec = decoder
-            check(dec?.isRecycled == false) { "Cannot decode region — decoder recycled" }
-            checkNotNull(dec) { "Decoder is null" }
-            val options = BitmapFactory.Options().apply {
-                inSampleSize      = sampleSize.coerceAtLeast(1)
-                inPreferredConfig = quality.toBitmapConfig()
-            }
-            dec.decodeRegion(sRect, options)
-                ?: error("BitmapRegionDecoder returned null for $sRect")
-        } finally {
-            decoderLock.readLock().unlock()
-        }
-    }
+	@WorkerThread
+	override fun decodeRegion(sRect: Rect, sampleSize: Int): Bitmap {
+		val sample = sampleSize.coerceAtLeast(1)
+		lock.read {
+			check(!recycled) { "Cannot decode region - decoder recycled" }
+			val h = handle
+			if (h != 0L) {
+				if (sample <= MAX_NATIVE_SAMPLE) {
+					val start = System.nanoTime()
+					val bmp = JpegNative.nativeDecodeRegion(
+						h,
+						sample,
+						sRect.left,
+						sRect.top,
+						sRect.right,
+						sRect.bottom,
+						quality.toBitmapConfig() == Bitmap.Config.RGB_565,
+					)
+					if (bmp != null) {
+						DecoderStats.onNativeTile(System.nanoTime() - start)
+						return bmp
+					}
+				}
+				DecoderStats.onSkiaFallback()
+			}
+			val start = System.nanoTime()
+			val dec = skiaDecoder()
+			val options = BitmapFactory.Options().apply {
+				inSampleSize = sample
+				inPreferredConfig = quality.toBitmapConfig()
+			}
+			val bmp = dec.decodeRegion(sRect, options) ?: error("BitmapRegionDecoder returned null for $sRect")
+			DecoderStats.onSkiaTile(System.nanoTime() - start)
+			return bmp
+		}
+	}
 
-    // ── isReady / recycle ─────────────────────────────────────────────────────
+	override val isReady: Boolean
+		get() = !recycled && (handle != 0L || skia?.isRecycled == false)
 
-    override val isReady: Boolean
-        @Synchronized get() = decoder?.isRecycled == false
+	override val isRegionDecodeCheap: Boolean get() = !costlyRegions
 
-    @Synchronized
-    override fun recycle() {
-        decoderLock.writeLock().lock()
-        try {
-            decoder?.recycle()
-            decoder = null
-        } finally {
-            decoderLock.writeLock().unlock()
-        }
-        // IMPORTANT: do NOT remove byteCache[sourceUriKey] here.
-        //
-        // reset(true) (called by setImage()/reloadImage()) recycles the OLD decoder
-        // SYNCHRONOUSLY, on the calling thread, BEFORE the NEW decoder is created and
-        // its init() runs on a worker thread. Both decoders share the same URI when
-        // reloadImage() is triggered by a filter change. Evicting the cache entry here
-        // would delete it one step before the new decoder's init() looks it up — turning
-        // every cache lookup on the exact scenario this cache exists for into a guaranteed
-        // miss, silently defeating the whole optimization and re-introducing the OOM in
-        // readBytes() that this cache was built to prevent.
-        //
-        // SoftReference already bounds memory under pressure: the GC clears the byte[]
-        // referent before throwing OOM, so cached entries never cause an OOM themselves.
-        // Opportunistic pruning (below) bounds unbounded key growth over very long
-        // reading sessions without ever discarding a still-valid, reusable entry.
-        pruneClearedCacheEntriesOpportunistically()
-        sourceUriKey = null
-        jpegBytes    = null
-    }
+	override fun recycle() {
+		lock.write {
+			recycled = true
+			val h = handle
+			handle = 0L
+			if (h != 0L) JpegNative.nativeClose(h)
+			skia?.recycle()
+			skia = null
+			privateTemp?.delete()
+			privateTemp = null
+			appContext = null
+			sourceUri = null
+		}
+	}
 
-    // ── URI helpers ───────────────────────────────────────────────────────────
+	/** Lazily created Skia decoder (JPEG fallback path). Called with the read lock held. */
+	private fun skiaDecoder(): BitmapRegionDecoder = synchronized(skiaLock) {
+		skia?.takeUnless { it.isRecycled }?.let { return it }
+		val ctx = checkNotNull(appContext) { "Decoder is not initialised" }
+		val uri = checkNotNull(sourceUri) { "Decoder is not initialised" }
+		openBitmapRegionDecoder(ctx, uri).also { skia = it }
+	}
 
-    /**
-     * Opens a [BitmapRegionDecoder] for all URI schemes supported by SSIV:
-     * content://, file://, file+zip:// (CBZ/ZIP archives), android.resource://.
-     */
-    @SuppressLint("DiscouragedApi")
-    private fun openBitmapRegionDecoder(context: Context, uri: Uri): BitmapRegionDecoder {
-        val brd: BitmapRegionDecoder = when (uri.scheme) {
-            URI_SCHEME_RES -> {
-                val packageName = uri.authority
-                val res = if (packageName == null || context.packageName == packageName) {
-                    context.resources
-                } else {
-                    context.packageManager.getResourcesForApplication(packageName)
-                }
-                var id = 0
-                val segments = uri.pathSegments
-                if (segments.size == 2 && segments[0] == "drawable") {
-                    id = res.getIdentifier(segments[1], "drawable", packageName)
-                } else if (segments.size == 1 && TextUtils.isDigitsOnly(segments[0])) {
-                    try { id = segments[0].toInt() } catch (_: NumberFormatException) {}
-                }
-                context.resources.openRawResource(id)
-                    .use { makeBrd(it, context, uri) }
-            }
-            URI_SCHEME_ZIP -> ZipFile(uri.schemeSpecificPart).use { zip ->
-                val entry = requireNotNull(zip.getEntry(uri.fragment)) {
-                    "Entry ${uri.fragment} not found in zip"
-                }
-                zip.getInputStream(entry).use { makeBrd(it, context, uri) }
-            }
-            URI_SCHEME_FILE -> {
-                val path = uri.schemeSpecificPart
-                if (path.startsWith(URI_PATH_ASSET, ignoreCase = true)) {
-                    val name = path.substring(URI_PATH_ASSET.length)
-                    context.assets.open(name, AssetManager.ACCESS_RANDOM)
-                        .use { makeBrd(it, context, uri) }
-                } else {
-                    BitmapRegionDecoder(path, context, uri)
-                }
-            }
-            URI_SCHEME_CONTENT -> {
-                context.contentResolver.openInputStream(uri)
-                    ?.use { makeBrd(it, context, uri) }
-                    ?: throw ImageDecodeException.create(context, uri)
-            }
-            else -> throw UnsupportedUriException(uri.toString())
-        }
-        return brd
-    }
+	// -- Native source resolution ---------------------------------------------------------------
 
-    private fun makeBrd(stream: InputStream, context: Context, uri: Uri): BitmapRegionDecoder =
-        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.S) {
-            BitmapRegionDecoder.newInstance(stream)
-                ?: throw ImageDecodeException.create(context, uri)
-        } else {
-            @Suppress("DEPRECATION")
-            BitmapRegionDecoder.newInstance(stream, false)
-                ?: throw ImageDecodeException.create(context, uri)
-        }
+	private class NativeSource(val file: File, val offset: Long, val length: Long, val privateTemp: File? = null)
 
-    /**
-     * Reads the full image bytes for the given URI.
-     * Supports content://, file://, file+zip:// and android.resource://.
-     * Returns null on any error — isJpeg will remain false and libjpeg-turbo
-     * is skipped; the image still displays via BitmapRegionDecoder.
-     */
-    @SuppressLint("DiscouragedApi")
-    private fun readBytes(context: Context, uri: Uri): ByteArray? = try {
-        when (uri.scheme) {
-            URI_SCHEME_CONTENT ->
-                context.contentResolver.openInputStream(uri)?.use { it.readBytes() }
-            URI_SCHEME_ZIP -> ZipFile(uri.schemeSpecificPart).use { zip ->
-                val entry = zip.getEntry(uri.fragment) ?: return null
-                zip.getInputStream(entry).use { it.readBytes() }
-            }
-            URI_SCHEME_FILE -> {
-                val path = uri.schemeSpecificPart
-                if (path.startsWith(URI_PATH_ASSET, ignoreCase = true)) {
-                    val name = path.substring(URI_PATH_ASSET.length)
-                    context.assets.open(name).use { it.readBytes() }
-                } else {
-                    File(path).readBytes()
-                }
-            }
-            URI_SCHEME_RES -> {
-                val packageName = uri.authority
-                val res = if (packageName == null || context.packageName == packageName) {
-                    context.resources
-                } else {
-                    context.packageManager.getResourcesForApplication(packageName)
-                }
-                var id = 0
-                val segments = uri.pathSegments
-                if (segments.size == 2 && segments[0] == "drawable") {
-                    id = res.getIdentifier(segments[1], "drawable", packageName)
-                } else if (segments.size == 1 && TextUtils.isDigitsOnly(segments[0])) {
-                    try { id = segments[0].toInt() } catch (_: NumberFormatException) {}
-                }
-                context.resources.openRawResource(id).use { it.readBytes() }
-            }
-            else -> null
-        }
-    } catch (_: Exception) { null }
+	/** Where the JPEG bytes can be mapped from, or null when this is not a (mappable) JPEG. */
+	private fun resolveNativeSource(context: Context, uri: Uri): NativeSource? = when (uri.scheme) {
+		URI_SCHEME_FILE -> {
+			val path = uri.schemeSpecificPart
+			val file = if (path.startsWith(URI_PATH_ASSET, ignoreCase = true)) null else File(path)
+			if (file != null && file.isFile && startsWithJpegMagic(file)) NativeSource(file, 0, file.length()) else null
+		}
 
-    /**
-     * Reads only the first [count] bytes of the image at [uri]. Used to peek at the JPEG
-     * magic bytes (FF D8 FF) without reading the entire file — avoids allocating and
-     * discarding multi-megabyte ByteArrays for every non-JPEG page during [init].
-     */
-    @SuppressLint("DiscouragedApi")
-    private fun readFirstBytes(context: Context, uri: Uri, count: Int): ByteArray? = try {
-        fun java.io.InputStream.peekFirst(n: Int): ByteArray? {
-            val buf = ByteArray(n)
-            return if (read(buf) == n) buf else null
-        }
-        when (uri.scheme) {
-            URI_SCHEME_CONTENT ->
-                context.contentResolver.openInputStream(uri)?.use { it.peekFirst(count) }
-            URI_SCHEME_ZIP -> ZipFile(uri.schemeSpecificPart).use { zip ->
-                val entry = zip.getEntry(uri.fragment) ?: return null
-                zip.getInputStream(entry).use { it.peekFirst(count) }
-            }
-            URI_SCHEME_FILE -> {
-                val path = uri.schemeSpecificPart
-                if (path.startsWith(URI_PATH_ASSET, ignoreCase = true)) {
-                    context.assets.open(path.substring(URI_PATH_ASSET.length)).use { it.peekFirst(count) }
-                } else {
-                    File(path).inputStream().use { it.peekFirst(count) }
-                }
-            }
-            URI_SCHEME_RES -> {
-                val packageName = uri.authority
-                val res = if (packageName == null || context.packageName == packageName) {
-                    context.resources
-                } else {
-                    context.packageManager.getResourcesForApplication(packageName)
-                }
-                var id = 0
-                val segments = uri.pathSegments
-                if (segments.size == 2 && segments[0] == "drawable") {
-                    id = res.getIdentifier(segments[1], "drawable", packageName)
-                } else if (segments.size == 1 && TextUtils.isDigitsOnly(segments[0])) {
-                    try { id = segments[0].toInt() } catch (_: NumberFormatException) {}
-                }
-                context.resources.openRawResource(id).use { it.peekFirst(count) }
-            }
-            else -> null
-        }
-    } catch (_: Exception) { null }
+		URI_SCHEME_ZIP -> resolveZipEntry(context, File(uri.schemeSpecificPart), uri.fragment)
 
-    // ── Factory ───────────────────────────────────────────────────────────────
+		URI_SCHEME_CONTENT -> {
+			val temp = newCacheFile(context, ".tmp")
+			var ok = false
+			try {
+				val copied = context.contentResolver.openInputStream(uri)?.use { copyIfJpeg(it, temp) } ?: false
+				ok = copied
+				if (copied) NativeSource(temp, 0, temp.length(), privateTemp = temp) else null
+			} finally {
+				if (!ok) temp.delete()
+			}
+		}
 
-    public class Factory @JvmOverloads constructor(
-        private val quality: BitmapQuality = BitmapQuality.STANDARD,
-    ) : DecoderFactory<LiJpegTurboRegionDecoder> {
-        // Required by DecoderFactory — applyBitmapConfig() in the app compares
-        // this value to decide whether to reinstall the factory.
-        override val bitmapConfig: Bitmap.Config
-            get() = quality.toBitmapConfig()
-        override fun make(): LiJpegTurboRegionDecoder = LiJpegTurboRegionDecoder(quality)
-    }
+		else -> null
+	}
 
-    // ── Companion ─────────────────────────────────────────────────────────────
+	private fun resolveZipEntry(context: Context, archive: File, name: String?): NativeSource? {
+		if (name == null || !archive.isFile) return null
+		ZipEntryLocator.locateStored(archive, name)?.let { loc ->
+			if (hasJpegMagicAt(archive, loc[0])) return NativeSource(archive, loc[0], loc[1])
+			return null
+		}
+		// Deflated (or ZIP64) entry: inflate once into the bounded cache directory, then map that file.
+		val key = "${archive.path}|${archive.length()}|${archive.lastModified()}|$name"
+		val cached = File(JpegExtractCache.dir(context), UUID.nameUUIDFromBytes(key.toByteArray()).toString() + ".jpg")
+		if (cached.isFile && cached.length() > 0) {
+			cached.setLastModified(System.currentTimeMillis())
+			return NativeSource(cached, 0, cached.length())
+		}
+		return ZipFile(archive).use { zip ->
+			val entry = zip.getEntry(name) ?: return@use null
+			if (entry.size <= 0 || entry.size > MAX_CACHED_ENTRY_BYTES) return@use null
+			val temp = newCacheFile(context, ".tmp")
+			var ok = false
+			try {
+				val copied = zip.getInputStream(entry).use { copyIfJpeg(it, temp) }
+				if (copied && temp.renameTo(cached)) {
+					ok = true
+					DecoderStats.onExtraction()
+					NativeSource(cached, 0, cached.length())
+				} else {
+					null
+				}
+			} finally {
+				if (!ok) temp.delete()
+			}
+		}
+	}
 
-    public companion object {
+	private fun openNative(source: NativeSource): Long = ParcelFileDescriptor.open(source.file, ParcelFileDescriptor.MODE_READ_ONLY).use { pfd ->
+		JpegNative.nativeOpen(pfd.fd, source.offset, source.length)
+	}
 
-        /**
-         * Process-level SoftReference cache: URI string → JPEG bytes.
-         *
-         * Eliminates redundant disk reads when the same URI is decoded by multiple
-         * [LiJpegTurboRegionDecoder] instances (e.g. after reloadImage() creates a new
-         * decoder for an already-loaded page). SoftReference lets GC reclaim entries
-         * under memory pressure — entries are NEVER explicitly evicted on recycle()
-         * (see comment in [recycle]); only already-cleared entries are pruned, and only
-         * occasionally, to bound key growth over very long reading sessions.
-         */
-        private val byteCache =
-            java.util.concurrent.ConcurrentHashMap<String, java.lang.ref.SoftReference<ByteArray>>()
+	/** Copies [input] to [out] only when it starts with the JPEG magic. false: not a JPEG (nothing kept). */
+	private fun copyIfJpeg(input: InputStream, out: File): Boolean {
+		val magic = ByteArray(3)
+		var n = 0
+		while (n < 3) {
+			val r = input.read(magic, n, 3 - n)
+			if (r < 0) return false
+			n += r
+		}
+		if (!isJpegMagic(magic)) return false
+		trimCache(out.parentFile)
+		out.outputStream().use { o ->
+			o.write(magic)
+			val buf = ByteArray(COPY_BUFFER_BYTES)
+			var total = 3L
+			while (true) {
+				val r = input.read(buf)
+				if (r < 0) break
+				total += r
+				if (total > MAX_CACHED_ENTRY_BYTES) return false
+				o.write(buf, 0, r)
+			}
+		}
+		return true
+	}
 
-        private val recycleCount = java.util.concurrent.atomic.AtomicInteger(0)
+	/**
+	 * Opens a [BitmapRegionDecoder] for all URI schemes supported by SSIV:
+	 * content://, file://, file+zip:// (CBZ/ZIP archives), android.resource://.
+	 */
+	@SuppressLint("DiscouragedApi")
+	private fun openBitmapRegionDecoder(context: Context, uri: Uri): BitmapRegionDecoder {
+		val brd: BitmapRegionDecoder = when (uri.scheme) {
+			URI_SCHEME_RES -> {
+				val packageName = uri.authority
+				val res = if (packageName == null || context.packageName == packageName) {
+					context.resources
+				} else {
+					context.packageManager.getResourcesForApplication(packageName)
+				}
+				var id = 0
+				val segments = uri.pathSegments
+				if (segments.size == 2 && segments[0] == "drawable") {
+					id = res.getIdentifier(segments[1], "drawable", packageName)
+				} else if (segments.size == 1 && TextUtils.isDigitsOnly(segments[0])) {
+					try {
+						id = segments[0].toInt()
+					} catch (_: NumberFormatException) {}
+				}
+				context.resources.openRawResource(id)
+					.use { makeBrd(it, context, uri) }
+			}
 
-        /**
-         * Removes entries whose SoftReference has already been cleared by the GC.
-         * Never removes a live entry — safe to call at any time. Runs every 64th
-         * recycle() call so the cost (a full map scan) stays negligible relative to
-         * page turn frequency.
-         */
-        private fun pruneClearedCacheEntriesOpportunistically() {
-            if (recycleCount.incrementAndGet() % 64 != 0) return
-            val it = byteCache.entries.iterator()
-            while (it.hasNext()) {
-                if (it.next().value.get() == null) it.remove()
-            }
-        }
+			URI_SCHEME_ZIP -> ZipFile(uri.schemeSpecificPart).use { zip ->
+				val entry = requireNotNull(zip.getEntry(uri.fragment)) {
+					"Entry ${uri.fragment} not found in zip"
+				}
+				zip.getInputStream(entry).use { makeBrd(it, context, uri) }
+			}
 
-        private fun isJpegMagic(bytes: ByteArray): Boolean =
-            bytes.size >= 3 &&
-            bytes[0] == 0xFF.toByte() &&
-            bytes[1] == 0xD8.toByte() &&
-            bytes[2] == 0xFF.toByte()
+			URI_SCHEME_FILE -> {
+				val path = uri.schemeSpecificPart
+				if (path.startsWith(URI_PATH_ASSET, ignoreCase = true)) {
+					val name = path.substring(URI_PATH_ASSET.length)
+					context.assets.open(name, AssetManager.ACCESS_RANDOM)
+						.use { makeBrd(it, context, uri) }
+				} else {
+					BitmapRegionDecoder(path, context, uri)
+				}
+			}
 
-        init {
-            System.loadLibrary("ssiv_jpeg_decoder")
-        }
-    }
+			URI_SCHEME_CONTENT -> {
+				context.contentResolver.openInputStream(uri)
+					?.use { makeBrd(it, context, uri) }
+					?: throw ImageDecodeException.create(context, uri)
+			}
 
-    // ── JNI ───────────────────────────────────────────────────────────────────
+			else -> throw UnsupportedUriException(uri.toString())
+		}
+		return brd
+	}
 
-    /**
-     * Decodes the tile region [sRectLeft, sRectTop, sRectRight, sRectBottom]
-     * (in source image coordinates) from [jpegData] via libjpeg-turbo's
-     * tj3SetCroppingRegion API at 1/[sampleSize] scale.
-     *
-     * Only the MCU blocks overlapping the requested region are decompressed —
-     * no full-image decode ever occurs.
-     *
-     * [rgb565] returns an RGB_565 bitmap (ordered-dithered) instead of ARGB_8888.
-     *
-     * Returns null on failure — caller falls back to BitmapRegionDecoder.
-     */
-    private external fun nativeDecodeRegion(
-        jpegData:    ByteArray,
-        imgWidth:    Int,
-        imgHeight:   Int,
-        sampleSize:  Int,
-        sRectLeft:   Int,
-        sRectTop:    Int,
-        sRectRight:  Int,
-        sRectBottom: Int,
-        rgb565:      Boolean,
-    ): Bitmap?
+	private fun makeBrd(stream: InputStream, context: Context, uri: Uri): BitmapRegionDecoder = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.S) {
+		BitmapRegionDecoder.newInstance(stream)
+			?: throw ImageDecodeException.create(context, uri)
+	} else {
+		@Suppress("DEPRECATION")
+		BitmapRegionDecoder.newInstance(stream, false)
+			?: throw ImageDecodeException.create(context, uri)
+	}
+
+	// -- Factory ---------------------------------------------------------------------------------
+
+	public class Factory @JvmOverloads constructor(
+		private val quality: BitmapQuality = BitmapQuality.STANDARD,
+	) : DecoderFactory<LiJpegTurboRegionDecoder> {
+		// Required by DecoderFactory - applyBitmapConfig() in the app compares
+		// this value to decide whether to reinstall the factory.
+		override val bitmapConfig: Bitmap.Config
+			get() = quality.toBitmapConfig()
+
+		override fun make(): LiJpegTurboRegionDecoder = LiJpegTurboRegionDecoder(quality)
+	}
+
+	private companion object {
+		/** libjpeg-turbo scales by 1/1, 1/2, 1/4 and 1/8 only; larger samples are decoded by Skia. */
+		const val MAX_NATIVE_SAMPLE = 8
+		const val COPY_BUFFER_BYTES = 64 * 1024
+		const val MAX_CACHED_ENTRY_BYTES = 64L * 1024 * 1024
+		const val MAX_CACHE_FILES = 24
+		const val MAX_CACHE_BYTES = 96L * 1024 * 1024
+		const val STALE_AFTER_MS = 24L * 60 * 60 * 1000
+
+		fun newCacheFile(context: Context, suffix: String): File = File(JpegExtractCache.dir(context), UUID.randomUUID().toString() + suffix)
+
+		/** Cheap guess used only to pick the prefetch policy: file magic for plain files, the name otherwise. */
+		fun isLikelyJpeg(uri: Uri): Boolean {
+			if (uri.scheme == URI_SCHEME_FILE) {
+				val file = File(uri.schemeSpecificPart)
+				return file.isFile && startsWithJpegMagic(file)
+			}
+			if (uri.scheme == URI_SCHEME_CONTENT) return true // magic was checked while copying; keep prefetch
+			val name = (uri.fragment ?: uri.lastPathSegment ?: return false).lowercase()
+			return name.endsWith(".jpg") || name.endsWith(".jpeg") || name.endsWith(".jpe")
+		}
+
+		fun isJpegMagic(b: ByteArray): Boolean = b.size >= 3 && b[0] == 0xFF.toByte() && b[1] == 0xD8.toByte() && b[2] == 0xFF.toByte()
+
+		fun startsWithJpegMagic(file: File): Boolean = hasJpegMagicAt(file, 0)
+
+		fun hasJpegMagicAt(file: File, offset: Long): Boolean = try {
+			java.io.RandomAccessFile(file, "r").use { raf ->
+				val b = ByteArray(3)
+				raf.seek(offset)
+				raf.readFully(b)
+				isJpegMagic(b)
+			}
+		} catch (_: IOException) {
+			false
+		}
+
+		/**
+		 * Keeps the extraction directory bounded: drops stale files, then the oldest ones until both the
+		 * file-count and the size limit hold. Unlinking a file that is still mapped is safe on Linux.
+		 */
+		fun trimCache(dir: File?) {
+			val files = dir?.listFiles() ?: return
+			val now = System.currentTimeMillis()
+			files.sortBy { it.lastModified() }
+			var count = files.size
+			var bytes = files.sumOf { it.length() }
+			for (f in files) {
+				val stale = now - f.lastModified() > STALE_AFTER_MS
+				if (!stale && count < MAX_CACHE_FILES && bytes < MAX_CACHE_BYTES) break
+				val len = f.length()
+				if (f.delete()) {
+					count--
+					bytes -= len
+				}
+			}
+		}
+	}
 }

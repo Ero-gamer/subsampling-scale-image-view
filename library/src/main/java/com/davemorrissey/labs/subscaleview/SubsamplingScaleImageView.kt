@@ -37,8 +37,8 @@ import androidx.lifecycle.LifecycleOwner
 import com.davemorrissey.labs.subscaleview.decoder.DecoderFactory
 import com.davemorrissey.labs.subscaleview.decoder.ImageDecoder
 import com.davemorrissey.labs.subscaleview.decoder.ImageRegionDecoder
-import com.davemorrissey.labs.subscaleview.decoder.SkiaImageDecoder
 import com.davemorrissey.labs.subscaleview.decoder.LiJpegTurboRegionDecoder
+import com.davemorrissey.labs.subscaleview.decoder.SkiaImageDecoder
 import com.davemorrissey.labs.subscaleview.decoder.toUri
 import com.davemorrissey.labs.subscaleview.internal.Anim
 import com.davemorrissey.labs.subscaleview.internal.BicubicRenderer
@@ -48,10 +48,10 @@ import com.davemorrissey.labs.subscaleview.internal.CompositeImageEventListener
 import com.davemorrissey.labs.subscaleview.internal.GestureListener
 import com.davemorrissey.labs.subscaleview.internal.InternalErrorHandler
 import com.davemorrissey.labs.subscaleview.internal.ScaleAndTranslate
-import com.davemorrissey.labs.subscaleview.internal.Tile
-import com.davemorrissey.labs.subscaleview.internal.TileMap
 import com.davemorrissey.labs.subscaleview.internal.SettledScaler
+import com.davemorrissey.labs.subscaleview.internal.Tile
 import com.davemorrissey.labs.subscaleview.internal.TileDecodeDispatcher
+import com.davemorrissey.labs.subscaleview.internal.TileMap
 import com.davemorrissey.labs.subscaleview.internal.TileMemory
 import com.davemorrissey.labs.subscaleview.internal.TouchEventDelegate
 import com.davemorrissey.labs.subscaleview.internal.createBitmapDownscaler
@@ -251,7 +251,12 @@ public open class SubsamplingScaleImageView @JvmOverloads constructor(
 			require(value in VALID_ZOOM_STYLES)
 			field = value
 		}
-	private var doubleTapZoomDuration: Int = 500
+
+	/** Double-tap zoom animation duration in milliseconds. */
+	public var doubleTapZoomDuration: Int = 500
+		set(value) {
+			field = value.coerceAtLeast(0)
+		}
 
 	// Current scale and scale at start of zoom
 	public var scale: Float = 0f
@@ -311,6 +316,7 @@ public open class SubsamplingScaleImageView @JvmOverloads constructor(
 	// Tile and image decoding
 	private var decoder: ImageRegionDecoder? = null
 	private val decoderLock = ReentrantReadWriteLock(true)
+
 	// Decoder factories. Both default to BitmapQuality.STANDARD (ARGB_8888), which is
 	// the correct color depth for manga/webtoon — 8 bits per channel, full alpha, no
 	// visible banding. Override to BitmapQuality.MEMORY_SAVING (RGB_565) only for
@@ -318,6 +324,7 @@ public open class SubsamplingScaleImageView @JvmOverloads constructor(
 	// RGBA_F16 ("HIGH") has been removed — it doubled memory per tile with no visible
 	// benefit on standard sRGB displays.
 	public var bitmapDecoderFactory: DecoderFactory<out ImageDecoder> = SkiaImageDecoder.Factory()
+
 	// LiJpegTurboRegionDecoder is the default: it uses libjpeg-turbo (software JPEG
 	// decoder via JNI) for large JPEG strip images (height >= 5000px) to bypass the
 	// hardware HAL chroma-upsampler bug that produces coloured tint bands on some
@@ -1265,13 +1272,9 @@ public open class SubsamplingScaleImageView @JvmOverloads constructor(
 		return viewToSourceCoord(mX.toFloat(), mY.toFloat(), outPoint)
 	}
 
-	public fun viewToSourceCoord(vxy: PointF): PointF? {
-		return viewToSourceCoord(vxy.x, vxy.y, PointF())
-	}
+	public fun viewToSourceCoord(vxy: PointF): PointF? = viewToSourceCoord(vxy.x, vxy.y, PointF())
 
-	public fun viewToSourceCoord(vx: Float, vy: Float): PointF? {
-		return viewToSourceCoord(vx, vy, PointF())
-	}
+	public fun viewToSourceCoord(vx: Float, vy: Float): PointF? = viewToSourceCoord(vx, vy, PointF())
 
 	private fun initialiseTileMap(maxTileDimensions: Point) {
 		tileMap?.recycleAll()
@@ -1316,6 +1319,14 @@ public open class SubsamplingScaleImageView @JvmOverloads constructor(
 					}
 				}
 			}
+			// Tile origins on multiples of 16 source pixels let the JPEG decoder decode every tile straight
+			// into its bitmap (MCU aligned crop == tile, no staging buffer or row copy).
+			val alignedW = alignTileSide(sTileWidth, xTiles, sWidth(), sampleSize, maxTileDimensions.x)
+			val alignedH = alignTileSide(sTileHeight, yTiles, sHeight(), sampleSize, maxTileDimensions.y)
+			if (pixelCap <= 0 || (alignedW / sampleSize).toLong() * (alignedH / sampleSize) <= pixelCap) {
+				sTileWidth = alignedW
+				sTileHeight = alignedH
+			}
 			val tileGrid = ArrayList<Tile>(xTiles * yTiles)
 			for (x in 0 until xTiles) {
 				for (y in 0 until yTiles) {
@@ -1342,6 +1353,19 @@ public open class SubsamplingScaleImageView @JvmOverloads constructor(
 		}
 	}
 
+	/**
+	 * Rounds a tile side up to a multiple of [TILE_ALIGNMENT] when that keeps the decoded tile within
+	 * [maxSub] and leaves a last tile of at least [TILE_ALIGNMENT] pixels; otherwise returns [tile] unchanged.
+	 */
+	private fun alignTileSide(tile: Int, tiles: Int, total: Int, sampleSize: Int, maxSub: Int): Int {
+		if (tiles <= 1 || tile < TILE_ALIGNMENT * 2) return tile
+		val up = (tile + TILE_ALIGNMENT - 1) / TILE_ALIGNMENT * TILE_ALIGNMENT
+		if (up == tile) return tile
+		if (up / sampleSize + tiles + 1 > maxSub) return tile
+		if ((tiles - 1).toLong() * up > total - TILE_ALIGNMENT) return tile
+		return up
+	}
+
 	public fun viewToSourceCoord(vx: Float, vy: Float, sTarget: PointF): PointF? {
 		if (vTranslate == null) {
 			return null
@@ -1358,18 +1382,12 @@ public open class SubsamplingScaleImageView @JvmOverloads constructor(
 		return sy * scale + (vTranslate ?: return Float.NaN).y
 	}
 
-	public fun sourceToViewCoord(sxy: PointF): PointF? {
-		return sourceToViewCoord(sxy.x, sxy.y, PointF())
-	}
+	public fun sourceToViewCoord(sxy: PointF): PointF? = sourceToViewCoord(sxy.x, sxy.y, PointF())
 
-	public fun sourceToViewCoord(sx: Float, sy: Float): PointF? {
-		return sourceToViewCoord(sx, sy, PointF())
-	}
+	public fun sourceToViewCoord(sx: Float, sy: Float): PointF? = sourceToViewCoord(sx, sy, PointF())
 
 	@CheckResult
-	public fun sourceToViewCoord(sxy: PointF, vTarget: PointF): PointF? {
-		return sourceToViewCoord(sxy.x, sxy.y, vTarget)
-	}
+	public fun sourceToViewCoord(sxy: PointF, vTarget: PointF): PointF? = sourceToViewCoord(sxy.x, sxy.y, vTarget)
 
 	@CheckResult
 	public fun sourceToViewCoord(sx: Float, sy: Float, vTarget: PointF): PointF? {
@@ -1558,7 +1576,9 @@ public open class SubsamplingScaleImageView @JvmOverloads constructor(
 				}
 			}
 		}
-		if (load && !deferDetail) {
+		// Decoders whose regions are costly (WebP, PNG) skip off-screen prefetch: those tiles stay in the
+		// low-resolution base layer until they are scrolled into view.
+		if (load && !deferDetail && decoder.isRegionDecodeCheap) {
 			TileMemory.beginPass()
 			val budget = tileBudgetBytes
 			for (value in tiles) {
@@ -1722,12 +1742,10 @@ public open class SubsamplingScaleImageView @JvmOverloads constructor(
 	}
 
 	@AnyThread
-	private fun getRequiredRotation(): Int {
-		return if (orientation == ORIENTATION_USE_EXIF) {
-			sOrientation
-		} else {
-			orientation
-		}
+	private fun getRequiredRotation(): Int = if (orientation == ORIENTATION_USE_EXIF) {
+		sOrientation
+	} else {
+		orientation
 	}
 
 	@Synchronized
@@ -1946,7 +1964,9 @@ public open class SubsamplingScaleImageView @JvmOverloads constructor(
 	private fun fileSRect(sRect: Rect, target: Rect) {
 		when (getRequiredRotation()) {
 			ORIENTATION_0 -> target.set(sRect)
+
 			ORIENTATION_90 -> target[sRect.top, sHeight - sRect.right, sRect.bottom] = sHeight - sRect.left
+
 			ORIENTATION_180 -> target[sWidth - sRect.right, sHeight - sRect.bottom, sWidth - sRect.left] =
 				sHeight - sRect.top
 
@@ -2081,9 +2101,7 @@ public open class SubsamplingScaleImageView @JvmOverloads constructor(
 	}
 
 	@JvmSynthetic
-	internal fun limitedScale(targetScale: Float): Float {
-		return minOf(maxScale, maxOf(minScale(), targetScale))
-	}
+	internal fun limitedScale(targetScale: Float): Float = minOf(maxScale, maxOf(minScale(), targetScale))
 
 	@JvmSynthetic
 	internal fun doubleTapZoom(sCenter: PointF, vFocus: PointF) {
@@ -2149,15 +2167,14 @@ public open class SubsamplingScaleImageView @JvmOverloads constructor(
 	}
 
 	@JvmSynthetic
-	internal fun limitedSCenter(sCenterX: Float, sCenterY: Float, scale: Float, sTarget: PointF) =
-		sTarget.also { target ->
-			val vTranslate: PointF = vTranslateForSCenter(sCenterX, sCenterY, scale)
-			val vxCenter = paddingLeft + (width - paddingRight - paddingLeft) / 2
-			val vyCenter = paddingTop + (height - paddingBottom - paddingTop) / 2
-			val sx = (vxCenter - vTranslate.x) / scale
-			val sy = (vyCenter - vTranslate.y) / scale
-			target.set(sx, sy)
-		}
+	internal fun limitedSCenter(sCenterX: Float, sCenterY: Float, scale: Float, sTarget: PointF) = sTarget.also { target ->
+		val vTranslate: PointF = vTranslateForSCenter(sCenterX, sCenterY, scale)
+		val vxCenter = paddingLeft + (width - paddingRight - paddingLeft) / 2
+		val vyCenter = paddingTop + (height - paddingBottom - paddingTop) / 2
+		val sx = (vxCenter - vTranslate.x) / scale
+		val sy = (vyCenter - vTranslate.y) / scale
+		target.set(sx, sy)
+	}
 
 	@JvmSynthetic
 	internal fun fitToBounds(center: Boolean) {
@@ -2255,7 +2272,9 @@ public open class SubsamplingScaleImageView @JvmOverloads constructor(
 		return if (vTranslate != null && sWidth > 0 && sHeight > 0) {
 			val center = getCenter() ?: return null
 			ImageViewState(scale, center.x, center.y, orientation)
-		} else null
+		} else {
+			null
+		}
 	}
 
 	public fun setScaleAndCenter(scale: Float, sCenter: PointF) {
@@ -2266,12 +2285,10 @@ public open class SubsamplingScaleImageView @JvmOverloads constructor(
 		invalidate()
 	}
 
-	public fun animateScaleAndCenter(scale: Float, sCenter: PointF): AnimationBuilder? {
-		return if (isReady) {
-			AnimationBuilder(this, scale, sCenter)
-		} else {
-			null
-		}
+	public fun animateScaleAndCenter(scale: Float, sCenter: PointF): AnimationBuilder? = if (isReady) {
+		AnimationBuilder(this, scale, sCenter)
+	} else {
+		null
 	}
 
 	public fun resetScaleAndCenter() {
@@ -2324,50 +2341,62 @@ public open class SubsamplingScaleImageView @JvmOverloads constructor(
 		return when (keyCode) {
 			KeyEvent.KEYCODE_ZOOM_IN,
 			KeyEvent.KEYCODE_NUMPAD_ADD,
-			KeyEvent.KEYCODE_PLUS -> isZoomEnabled && scaleBy(1.4f)
+			KeyEvent.KEYCODE_PLUS,
+			-> isZoomEnabled && scaleBy(1.4f)
 
 			KeyEvent.KEYCODE_ZOOM_OUT,
 			KeyEvent.KEYCODE_NUMPAD_SUBTRACT,
-			KeyEvent.KEYCODE_MINUS -> isZoomEnabled && scaleBy(0.6f)
+			KeyEvent.KEYCODE_MINUS,
+			-> isZoomEnabled && scaleBy(0.6f)
 
 			KeyEvent.KEYCODE_DPAD_UP -> isPanEnabled && isScaled() && panBy(0f, -pan)
+
 			KeyEvent.KEYCODE_DPAD_UP_RIGHT -> isPanEnabled && isScaled() && panBy(pan, -pan)
+
 			KeyEvent.KEYCODE_DPAD_RIGHT -> isPanEnabled && isScaled() && panBy(pan, 0f)
+
 			KeyEvent.KEYCODE_DPAD_DOWN_RIGHT -> isPanEnabled && isScaled() && panBy(pan, pan)
+
 			KeyEvent.KEYCODE_DPAD_DOWN -> isPanEnabled && isScaled() && panBy(0f, pan)
+
 			KeyEvent.KEYCODE_DPAD_DOWN_LEFT -> isPanEnabled && isScaled() && panBy(-pan, pan)
+
 			KeyEvent.KEYCODE_DPAD_LEFT -> isPanEnabled && isScaled() && panBy(-pan, 0f)
+
 			KeyEvent.KEYCODE_DPAD_UP_LEFT -> isPanEnabled && isScaled() && panBy(-pan, -pan)
+
 			KeyEvent.KEYCODE_ESCAPE,
-			KeyEvent.KEYCODE_DPAD_CENTER -> isZoomEnabled && isScaled() && scaleBy(0f)
+			KeyEvent.KEYCODE_DPAD_CENTER,
+			-> isZoomEnabled && isScaled() && scaleBy(0f)
 
 			else -> false
 		} || super.onKeyDown(keyCode, event)
 	}
 
-	override fun onKeyUp(keyCode: Int, event: KeyEvent?): Boolean {
-		return when (keyCode) {
-			KeyEvent.KEYCODE_ZOOM_OUT,
-			KeyEvent.KEYCODE_ZOOM_IN,
-			KeyEvent.KEYCODE_NUMPAD_ADD,
-			KeyEvent.KEYCODE_PLUS,
-			KeyEvent.KEYCODE_NUMPAD_SUBTRACT,
-			KeyEvent.KEYCODE_MINUS -> isZoomEnabled
+	override fun onKeyUp(keyCode: Int, event: KeyEvent?): Boolean = when (keyCode) {
+		KeyEvent.KEYCODE_ZOOM_OUT,
+		KeyEvent.KEYCODE_ZOOM_IN,
+		KeyEvent.KEYCODE_NUMPAD_ADD,
+		KeyEvent.KEYCODE_PLUS,
+		KeyEvent.KEYCODE_NUMPAD_SUBTRACT,
+		KeyEvent.KEYCODE_MINUS,
+		-> isZoomEnabled
 
-			KeyEvent.KEYCODE_DPAD_UP,
-			KeyEvent.KEYCODE_DPAD_UP_RIGHT,
-			KeyEvent.KEYCODE_DPAD_RIGHT,
-			KeyEvent.KEYCODE_DPAD_DOWN_RIGHT,
-			KeyEvent.KEYCODE_DPAD_DOWN,
-			KeyEvent.KEYCODE_DPAD_DOWN_LEFT,
-			KeyEvent.KEYCODE_DPAD_LEFT,
-			KeyEvent.KEYCODE_DPAD_UP_LEFT -> isPanEnabled && isScaled()
+		KeyEvent.KEYCODE_DPAD_UP,
+		KeyEvent.KEYCODE_DPAD_UP_RIGHT,
+		KeyEvent.KEYCODE_DPAD_RIGHT,
+		KeyEvent.KEYCODE_DPAD_DOWN_RIGHT,
+		KeyEvent.KEYCODE_DPAD_DOWN,
+		KeyEvent.KEYCODE_DPAD_DOWN_LEFT,
+		KeyEvent.KEYCODE_DPAD_LEFT,
+		KeyEvent.KEYCODE_DPAD_UP_LEFT,
+		-> isPanEnabled && isScaled()
 
-			KeyEvent.KEYCODE_ESCAPE,
-			KeyEvent.KEYCODE_DPAD_CENTER -> isZoomEnabled && isScaled()
+		KeyEvent.KEYCODE_ESCAPE,
+		KeyEvent.KEYCODE_DPAD_CENTER,
+		-> isZoomEnabled && isScaled()
 
-			else -> super.onKeyDown(keyCode, event)
-		}
+		else -> super.onKeyDown(keyCode, event)
 	}
 
 	override fun onGenericMotionEvent(event: MotionEvent): Boolean {
@@ -2402,9 +2431,7 @@ public open class SubsamplingScaleImageView @JvmOverloads constructor(
 		return super.onGenericMotionEvent(event)
 	}
 
-	private fun px(px: Int): Int {
-		return (density * px).toInt()
-	}
+	private fun px(px: Int): Int = (density * px).toInt()
 
 	private fun isScaled() = scale > minScale
 
@@ -2446,6 +2473,7 @@ public open class SubsamplingScaleImageView @JvmOverloads constructor(
 
 		/** Tiles are never split below this many decoded pixels per side by [maxTilePixels]. */
 		private const val MIN_TILE_SIDE = 128
+		private const val TILE_ALIGNMENT = 16
 		internal const val TAG = "SSIV"
 
 		// A custom scaler is only used when every source pixel covers clearly more than one

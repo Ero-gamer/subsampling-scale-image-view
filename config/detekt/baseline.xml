@@ -1,0 +1,10 @@
+<?xml version="1.0" ?>
+<SmellBaseline>
+  <ManuallySuppressedIssues/>
+  <CurrentIssues>
+    <ID>CyclomaticComplexMethod:TouchEventDelegate.kt$TouchEventDelegate$fun dispatchTouchEvent(event: MotionEvent): Boolean</ID>
+    <ID>LargeClass:SubsamplingScaleImageView.kt$SubsamplingScaleImageView : View</ID>
+    <ID>LongMethod:SubsamplingScaleImageView.kt$SubsamplingScaleImageView$override fun onDraw(canvas: Canvas)</ID>
+    <ID>LongMethod:TouchEventDelegate.kt$TouchEventDelegate$fun dispatchTouchEvent(event: MotionEvent): Boolean</ID>
+  </CurrentIssues>
+</SmellBaseline>

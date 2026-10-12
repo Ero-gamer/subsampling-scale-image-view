@@ -47,6 +47,8 @@ public class FilteringRegionDecoder(
     override fun init(context: Context, source: ImageSource): Point = inner.init(context, source)
     override fun decodeRegion(sRect: Rect, sampleSize: Int): Bitmap = inner.decodeRegion(sRect, sampleSize)
     override val isReady: Boolean get() = inner.isReady
+
+    override val isRegionDecodeCheap: Boolean get() = inner.isRegionDecodeCheap
     override fun recycle() = inner.recycle()
 
     public class Factory(

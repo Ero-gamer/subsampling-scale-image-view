@@ -1,0 +1,25 @@
+// Used only by .github/workflows/spotless-fix.yml (./gradlew -I <this file> spotlessApply).
+// Applies Spotless to the root project without touching the library's own build files, so
+// JitPack/normal builds are unaffected.
+initscript {
+    repositories {
+        gradlePluginPortal()
+        mavenCentral()
+    }
+    dependencies {
+        classpath 'com.diffplug.spotless:spotless-plugin-gradle:8.10.4'
+    }
+}
+
+rootProject {
+    apply plugin: com.diffplug.gradle.spotless.SpotlessPlugin
+    spotless {
+        kotlin {
+            target 'library/src/**/*.kt'
+            targetExclude '**/build/**'
+            ktlint('1.8.0')
+            trimTrailingWhitespace()
+            endWithNewline()
+        }
+    }
+}

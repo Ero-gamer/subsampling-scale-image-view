@@ -243,7 +243,7 @@ public open class SkiaPooledImageRegionDecoder @JvmOverloads constructor(
 					}
 				}
 			}
-			throw IllegalStateException("Cannot decode region after decoder has been recycled")
+			error("Cannot decode region after decoder has been recycled")
 		} finally {
 			decoderLock.readLock().unlock()
 		}

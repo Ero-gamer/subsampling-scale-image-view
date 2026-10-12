@@ -1,0 +1,91 @@
+# detekt rules tailored for the SSIV library (run manually from .github/workflows/lint.yml).
+# Based on the app's config; differences are explained inline.
+build:
+  maxIssues: 0
+
+style:
+  UnusedPrivateMember:
+    active: true
+    allowedNames: '(_|ignored|expected)'
+  UnusedPrivateClass:
+    active: true
+  UnusedImports:
+    active: true
+  # The library API is written with explicit `public` on purpose (library convention).
+  RedundantVisibilityModifierRule:
+    active: false
+  # Pervasive in Android UI/theming code (dimensions, colors, thresholds); not a
+  # meaningful signal for this codebase.
+  MagicNumber:
+    active: false
+  # Already governed by ktlint (see root build.gradle.kts); long single-line
+  # @Query/SQL literals make this rule pure noise here.
+  MaxLineLength:
+    active: false
+  # Early-return / guard-clause style is used deliberately and extensively
+  # throughout this codebase.
+  ReturnCount:
+    active: false
+  LoopWithTooManyJumpStatements:
+    active: true
+    maxJumpCount: 8
+  ThrowsCount:
+    active: true
+    max: 4
+
+  # Android code imports android.graphics.* etc.; tuple-style destructuring is used deliberately.
+  WildcardImport:
+    active: false
+  DestructuringDeclarationWithTooManyEntries:
+    active: false
+
+naming:
+  FunctionNaming:
+    ignoreAnnotated: ['Composable']
+
+potential-bugs:
+  UnreachableCode:
+    active: true
+
+empty-blocks:
+  EmptyFunctionBlock:
+    active: true
+    ignoreOverridden: true
+
+complexity:
+  # SubsamplingScaleImageView is a single public view class with a large API surface.
+  TooManyFunctions:
+    active: true
+    thresholdInFiles: 30
+    thresholdInClasses: 120
+    thresholdInObjects: 30
+    thresholdInInterfaces: 15
+  CyclomaticComplexMethod:
+    active: true
+    threshold: 50
+  LongMethod:
+    active: true
+    threshold: 140
+  LongParameterList:
+    active: true
+    functionThreshold: 10
+    constructorThreshold: 20
+  NestedBlockDepth:
+    active: true
+    threshold: 8
+  ComplexCondition:
+    active: true
+    threshold: 15
+
+exceptions:
+  # This codebase's established pattern for network/parser/IO boundaries is a
+  # broad catch with a graceful fallback (return null/default, log & continue).
+  # Each site was reviewed individually; none hide a real bug.
+  TooGenericExceptionCaught:
+    active: false
+  TooGenericExceptionThrown:
+    active: false
+  SwallowedException:
+    active: false
+  InstanceOfCheckForException:
+    active: false

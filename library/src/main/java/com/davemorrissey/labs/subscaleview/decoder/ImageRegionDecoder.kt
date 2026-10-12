@@ -68,6 +68,13 @@ public interface ImageRegionDecoder {
 	public val isReady: Boolean
 
 	/**
+	 * False when decoding a region costs about as much as decoding everything above it (WebP, PNG, ...).
+	 * The view then decodes only the tiles on screen and skips off-screen prefetch, so the rest of the
+	 * page stays in the low-resolution base layer until it is scrolled into view.
+	 */
+	public val isRegionDecodeCheap: Boolean get() = true
+
+	/**
 	 * This method will be called when the decoder is no longer required. It should clean up any resources still in use.
 	 */
 	public fun recycle()

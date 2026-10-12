@@ -3,7 +3,7 @@ project(ssiv_jpeg_decoder)
 
 include(ExternalProject)
 
-# ── libjpeg-turbo 3.1.4.1 ────────────────────────────────────────────────────
+# ── libjpeg-turbo 3.2.0 ────────────────────────────────────────────────────
 # FetchContent / add_subdirectory() are explicitly blocked by libjpeg-turbo's
 # own CMakeLists.txt. ExternalProject_Add builds it in a fully isolated
 # sub-build so it never gets included as a subdirectory.
@@ -61,7 +61,7 @@ set_target_properties(turbojpeg_static PROPERTIES
 file(MAKE_DIRECTORY "${LJPEG_INCLUDE_DIR}")
 
 # ── JNI bridge ────────────────────────────────────────────────────────────────
-add_library(ssiv_jpeg_decoder SHARED jpeg_region_decoder.cpp)
+add_library(ssiv_jpeg_decoder SHARED jpeg_jni.cpp jpeg_core.cpp)
 
 add_dependencies(ssiv_jpeg_decoder libjpeg_turbo_ext)
 
@@ -72,4 +72,14 @@ target_link_libraries(ssiv_jpeg_decoder
     jnigraphics
     android
     log
+)
+
+# 16 KB page-size compatible ELF segments (Android 15+ devices), smaller and faster-loading library.
+target_compile_options(ssiv_jpeg_decoder PRIVATE -O2 -fvisibility=hidden -ffunction-sections -fdata-sections)
+# --exclude-libs hides the static libjpeg-turbo symbols; --icf=safe folds identical code (lld, NDK default).
+target_link_options(ssiv_jpeg_decoder PRIVATE
+    -Wl,-z,max-page-size=16384
+    -Wl,--gc-sections
+    -Wl,--exclude-libs,ALL
+    -Wl,--icf=safe
 )
