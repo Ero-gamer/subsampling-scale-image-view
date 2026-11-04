@@ -7,7 +7,7 @@ initscript {
         mavenCentral()
     }
     dependencies {
-        classpath 'com.diffplug.spotless:spotless-plugin-gradle:8.10.4'
+        classpath 'com.diffplug.spotless:spotless-plugin-gradle:8.11.0'
     }
 }
 
