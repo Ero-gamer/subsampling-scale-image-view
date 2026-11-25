@@ -80,6 +80,7 @@ import java.util.concurrent.locks.ReentrantReadWriteLock
 import kotlin.math.ceil
 import kotlin.math.floor
 import kotlin.math.min
+import kotlin.math.pow
 import kotlin.math.roundToInt
 
 @Suppress("MemberVisibilityCanBePrivate")
@@ -130,6 +131,7 @@ public open class SubsamplingScaleImageView @JvmOverloads constructor(
 	public var orientation: Int = ORIENTATION_0
 		set(value) {
 			require(value in VALID_ORIENTATIONS)
+			if (field == value) return
 			field = value
 			reset(false)
 			invalidate()
@@ -255,8 +257,11 @@ public open class SubsamplingScaleImageView @JvmOverloads constructor(
 	/** Double-tap zoom animation duration in milliseconds. */
 	public var doubleTapZoomDuration: Int = 500
 		set(value) {
-			field = value.coerceAtLeast(0)
+			field = value.coerceAtLeast(1)
 		}
+
+	/** When false a double tap (and a quick-scale tap) no longer zooms; pinch and pan are unaffected. */
+	public var isDoubleTapZoomEnabled: Boolean = true
 
 	// Current scale and scale at start of zoom
 	public var scale: Float = 0f
@@ -327,7 +332,7 @@ public open class SubsamplingScaleImageView @JvmOverloads constructor(
 
 	// LiJpegTurboRegionDecoder is the default: it uses libjpeg-turbo (software JPEG
 	// decoder via JNI) for large JPEG strip images (height >= 5000px) to bypass the
-	// hardware HAL chroma-upsampler bug that produces coloured tint bands on some
+	// hardware HAL chroma-upsampler bug that produces colored tint bands on some
 	// devices. All other images fall back to BitmapRegionDecoder (Skia/hardware).
 	public var regionDecoderFactory: DecoderFactory<out ImageRegionDecoder> = LiJpegTurboRegionDecoder.Factory()
 
@@ -403,6 +408,20 @@ public open class SubsamplingScaleImageView @JvmOverloads constructor(
 			field = value
 			bitmapPaint?.colorFilter = value
 		}
+
+	/**
+	 * ARGB colour laid over the image after everything else is drawn (tiles, filters, scalers). A colour
+	 * mixed into [colorFilter]'s matrix is clamped together with the other adjustments, which hides the tint
+	 * wherever they already pushed a channel past white; drawing it on top mixes it with the final pixels.
+	 * Covers the image only, not the view's background. `0` (or alpha 0) draws nothing.
+	 */
+	public var overlayColor: Int = 0
+		set(value) {
+			if (field == value) return
+			field = value
+			invalidate()
+		}
+	private var overlayPaint: Paint? = null
 
 	/**
 	 * Resampling used when a bitmap is drawn magnified (zoomed in past 1:1). On Android 13+ it is
@@ -692,7 +711,9 @@ public open class SubsamplingScaleImageView @JvmOverloads constructor(
 	public fun setMinimumTileDpi(minimumTileDpi: Int) {
 		val metrics = resources.displayMetrics
 		val averageDpi = (metrics.xdpi + metrics.ydpi) / 2
-		this.minimumTileDpi = minOf(averageDpi, minimumTileDpi.toFloat()).toInt()
+		val newDpi = minOf(averageDpi, minimumTileDpi.toFloat()).toInt()
+		if (newDpi == this.minimumTileDpi) return
+		this.minimumTileDpi = newDpi
 		if (isReady) {
 			reset(false)
 			invalidate()
@@ -705,6 +726,7 @@ public open class SubsamplingScaleImageView @JvmOverloads constructor(
 	 * Safe to call before or after image load — triggers a reset+redraw if already ready.
 	 */
 	public fun setMaxTileSize(maxWidth: Int, maxHeight: Int) {
+		if (maxWidth == maxTileWidth && maxHeight == maxTileHeight) return
 		this.maxTileWidth = maxWidth
 		this.maxTileHeight = maxHeight
 		if (isReady) {
@@ -827,71 +849,64 @@ public open class SubsamplingScaleImageView @JvmOverloads constructor(
 							tileBgPaint?.let {
 								canvas.drawRect(tile.vRect, it)
 							}
-							if (matrix2 == null) {
-								matrix2 = Matrix()
+							// ORIENTATION_0 (always, in the reader): the matrix would be plain scale + translate onto
+							// vRect, which drawBitmap(src, null, dst) does without the per-tile setPolyToPoly JNI call.
+							val rotation = getRequiredRotation()
+							if (rotation != ORIENTATION_0) {
+								if (matrix2 == null) {
+									matrix2 = Matrix()
+								}
+								matrix2!!.reset()
+								setMatrixArray(
+									srcArray,
+									0f,
+									0f,
+									tileBitmap.width.toFloat(),
+									0f,
+									tileBitmap.width.toFloat(),
+									tileBitmap.height.toFloat(),
+									0f,
+									tileBitmap.height.toFloat(),
+								)
+								if (rotation == ORIENTATION_90) {
+									setMatrixArray(
+										dstArray,
+										tile.vRect.right.toFloat(),
+										tile.vRect.top.toFloat(),
+										tile.vRect.right.toFloat(),
+										tile.vRect.bottom.toFloat(),
+										tile.vRect.left.toFloat(),
+										tile.vRect.bottom.toFloat(),
+										tile.vRect.left.toFloat(),
+										tile.vRect.top.toFloat(),
+									)
+								} else if (rotation == ORIENTATION_180) {
+									setMatrixArray(
+										dstArray,
+										tile.vRect.right.toFloat(),
+										tile.vRect.bottom.toFloat(),
+										tile.vRect.left.toFloat(),
+										tile.vRect.bottom.toFloat(),
+										tile.vRect.left.toFloat(),
+										tile.vRect.top.toFloat(),
+										tile.vRect.right.toFloat(),
+										tile.vRect.top.toFloat(),
+									)
+								} else if (rotation == ORIENTATION_270) {
+									setMatrixArray(
+										dstArray,
+										tile.vRect.left.toFloat(),
+										tile.vRect.bottom.toFloat(),
+										tile.vRect.left.toFloat(),
+										tile.vRect.top.toFloat(),
+										tile.vRect.right.toFloat(),
+										tile.vRect.top.toFloat(),
+										tile.vRect.right.toFloat(),
+										tile.vRect.bottom.toFloat(),
+									)
+								}
+								matrix2!!.setPolyToPoly(srcArray, 0, dstArray, 0, 4)
 							}
-							matrix2!!.reset()
-							setMatrixArray(
-								srcArray,
-								0f,
-								0f,
-								tileBitmap.width.toFloat(),
-								0f,
-								tileBitmap.width.toFloat(),
-								tileBitmap.height.toFloat(),
-								0f,
-								tileBitmap.height.toFloat(),
-							)
-							if (getRequiredRotation() == ORIENTATION_0) {
-								setMatrixArray(
-									dstArray,
-									tile.vRect.left.toFloat(),
-									tile.vRect.top.toFloat(),
-									tile.vRect.right.toFloat(),
-									tile.vRect.top.toFloat(),
-									tile.vRect.right.toFloat(),
-									tile.vRect.bottom.toFloat(),
-									tile.vRect.left.toFloat(),
-									tile.vRect.bottom.toFloat(),
-								)
-							} else if (getRequiredRotation() == ORIENTATION_90) {
-								setMatrixArray(
-									dstArray,
-									tile.vRect.right.toFloat(),
-									tile.vRect.top.toFloat(),
-									tile.vRect.right.toFloat(),
-									tile.vRect.bottom.toFloat(),
-									tile.vRect.left.toFloat(),
-									tile.vRect.bottom.toFloat(),
-									tile.vRect.left.toFloat(),
-									tile.vRect.top.toFloat(),
-								)
-							} else if (getRequiredRotation() == ORIENTATION_180) {
-								setMatrixArray(
-									dstArray,
-									tile.vRect.right.toFloat(),
-									tile.vRect.bottom.toFloat(),
-									tile.vRect.left.toFloat(),
-									tile.vRect.bottom.toFloat(),
-									tile.vRect.left.toFloat(),
-									tile.vRect.top.toFloat(),
-									tile.vRect.right.toFloat(),
-									tile.vRect.top.toFloat(),
-								)
-							} else if (getRequiredRotation() == ORIENTATION_270) {
-								setMatrixArray(
-									dstArray,
-									tile.vRect.left.toFloat(),
-									tile.vRect.bottom.toFloat(),
-									tile.vRect.left.toFloat(),
-									tile.vRect.top.toFloat(),
-									tile.vRect.right.toFloat(),
-									tile.vRect.top.toFloat(),
-									tile.vRect.right.toFloat(),
-									tile.vRect.bottom.toFloat(),
-								)
-							}
-							matrix2!!.setPolyToPoly(srcArray, 0, dstArray, 0, 4)
 							if (!drawWithScaler(
 									canvas,
 									tileBitmap,
@@ -901,7 +916,11 @@ public open class SubsamplingScaleImageView @JvmOverloads constructor(
 									tile.vRect.height().toFloat() / tileBitmap.height,
 								)
 							) {
-								canvas.drawBitmap(tileBitmap, matrix2!!, bitmapPaint)
+								if (rotation == ORIENTATION_0) {
+									canvas.drawBitmap(tileBitmap, null, tile.vRect, bitmapPaint)
+								} else {
+									canvas.drawBitmap(tileBitmap, matrix2!!, bitmapPaint)
+								}
 							}
 							if (isDebugDrawingEnabled) {
 								canvas.drawRect(tile.vRect, debugLinePaint!!)
@@ -968,6 +987,7 @@ public open class SubsamplingScaleImageView @JvmOverloads constructor(
 			}
 		}
 		drawSettledOverlay(canvas)
+		drawOverlayColor(canvas)
 		if (isDebugDrawingEnabled) {
 			canvas.drawText(
 				"Scale: " + String.format(Locale.ENGLISH, "%.2f", scale) + " (" + String.format(
@@ -1065,7 +1085,21 @@ public open class SubsamplingScaleImageView @JvmOverloads constructor(
 		settledScaler = null
 		bitmapScaler = null
 		bitmapDownscaler = null
+		touchEventDelegate.reset() // drops a pending long-click so it cannot fire on the next image
 		super.onDetachedFromWindow()
+	}
+
+	/** Draws [overlayColor] over the displayed image rectangle (axis aligned for every supported rotation). */
+	private fun drawOverlayColor(canvas: Canvas) {
+		val color = overlayColor
+		if (Color.alpha(color) == 0 || vTranslate == null) return
+		val x0 = sourceToViewX(0f)
+		val y0 = sourceToViewY(0f)
+		val x1 = sourceToViewX(sWidth().toFloat())
+		val y1 = sourceToViewY(sHeight().toFloat())
+		val paint = overlayPaint ?: Paint().also { overlayPaint = it }
+		paint.color = color
+		canvas.drawRect(minOf(x0, x1), minOf(y0, y1), maxOf(x0, x1), maxOf(y0, y1), paint)
 	}
 
 	/** Draws (or schedules) the settled bicubic overlay used below Android 13. */
@@ -1460,7 +1494,12 @@ public open class SubsamplingScaleImageView @JvmOverloads constructor(
 		satTemp = null
 		matrix2 = null
 		sRect = null
+		settledScaler?.release() // the overlay belongs to the previous image
 		if (isNewImage) {
+			// A custom minimum belongs to the image it was computed for; keeping it would fit the next
+			// image (of another size) to the previous one's scale until the host sets it again.
+			_minScale = 0f
+			observedBytesPerPixel = 0
 			coroutineScope.coroutineContext[Job]?.cancelChildren()
 			// BUG 2 FIX: increment generation so any in-flight tile loads are discarded.
 			tileGeneration.incrementAndGet()
@@ -1578,7 +1617,10 @@ public open class SubsamplingScaleImageView @JvmOverloads constructor(
 		}
 		// Decoders whose regions are costly (WebP, PNG) skip off-screen prefetch: those tiles stay in the
 		// low-resolution base layer until they are scrolled into view.
-		if (load && !deferDetail && decoder.isRegionDecodeCheap) {
+		// When the load window is the view itself (pager views) every tile it touches is already handled by
+		// the visible pass above, so this scan could not find anything.
+		val windowIsView = w.left == 0 && w.top == 0 && w.right == width && w.bottom == height
+		if (load && !deferDetail && !windowIsView && decoder.isRegionDecodeCheap) {
 			TileMemory.beginPass()
 			val budget = tileBudgetBytes
 			for (value in tiles) {
@@ -1596,9 +1638,14 @@ public open class SubsamplingScaleImageView @JvmOverloads constructor(
 	/** Whether decoding of detail tiles is postponed right now (see [refreshRequiredTiles]). */
 	protected open fun isTileLoadingDeferred(): Boolean = false
 
+	/** Bytes per pixel of the tiles this view really decodes (2 for RGB_565, 4 for ARGB_8888); 0 = unknown yet. */
+	@Volatile
+	private var observedBytesPerPixel = 0
+
 	private fun estimatedBytes(tile: Tile): Long {
 		val step = (tile.sampleSize * downSampling).coerceAtLeast(1)
-		return tile.sRect.width().toLong() / step * (tile.sRect.height().toLong() / step) * BYTES_PER_PIXEL
+		val bpp = observedBytesPerPixel.takeIf { it > 0 } ?: BYTES_PER_PIXEL.toInt()
+		return tile.sRect.width().toLong() / step * (tile.sRect.height().toLong() / step) * bpp
 	}
 
 	/** Memory held by this view's tile bitmaps. */
@@ -1774,15 +1821,21 @@ public open class SubsamplingScaleImageView @JvmOverloads constructor(
 						bitmapDecoderFactory.make().decode(context, source, downSampling)
 					}
 				}
-				val orientation = async {
-					runInterruptible(backgroundDispatcher) {
-						getExifOrientation(context, source)
+				// EXIF is only consulted for ORIENTATION_USE_EXIF; reading it costs a file open + parse
+				// (and a zip directory parse for archive sources) per page.
+				val orientation = if (!preview && this@SubsamplingScaleImageView.orientation == ORIENTATION_USE_EXIF) {
+					async {
+						runInterruptible(backgroundDispatcher) {
+							getExifOrientation(context, source)
+						}
 					}
+				} else {
+					null
 				}
 				if (preview) {
 					onPreviewLoaded(bitmap.await())
 				} else {
-					onImageLoaded(bitmap.await(), orientation.await(), false)
+					onImageLoaded(bitmap.await(), orientation?.await() ?: ORIENTATION_0, false)
 				}
 			} catch (e: CancellationException) {
 				throw e
@@ -1799,15 +1852,24 @@ public open class SubsamplingScaleImageView @JvmOverloads constructor(
 
 	private fun initTiles(decoderFactory: DecoderFactory<out ImageRegionDecoder>, source: Uri) {
 		coroutineScope.launch {
+			// Kept local until the init is done: a field written from the background thread could be
+			// replaced by (or recycled with) a cancelled init of the previous image on a fast page change,
+			// leaving this view with the wrong image's decoder.
+			var created: ImageRegionDecoder? = null
 			try {
-				val exifOrientation = async {
-					runInterruptible(backgroundDispatcher) {
-						getExifOrientation(context, source)
+				val exifOrientation = if (this@SubsamplingScaleImageView.orientation == ORIENTATION_USE_EXIF) {
+					async {
+						runInterruptible(backgroundDispatcher) {
+							getExifOrientation(context, source)
+						}
 					}
+				} else {
+					null
 				}
-				val (w, h) = runInterruptible(backgroundDispatcher) {
-					decoder = decoderFactory.make()
-					val dimensions = checkNotNull(decoder).init(context, source)
+				val (newDecoder, size) = runInterruptible(backgroundDispatcher) {
+					val made = decoderFactory.make()
+					created = made
+					val dimensions = made.init(context, source)
 					var sWidth = dimensions.x
 					var sHeight = dimensions.y
 					sRegion?.also {
@@ -1818,13 +1880,29 @@ public open class SubsamplingScaleImageView @JvmOverloads constructor(
 						sWidth = it.width()
 						sHeight = it.height()
 					}
-					sWidth to sHeight
+					made to (sWidth to sHeight)
 				}
-				onTilesInited(checkNotNull(decoder), w, h, exifOrientation.await())
+				val orientation = exifOrientation?.await() ?: ORIENTATION_0
+				created = null // handed over to the view
+				onTilesInited(newDecoder, size.first, size.second, orientation)
 			} catch (e: CancellationException) {
+				discardDecoder(created)
 				throw e
 			} catch (error: Throwable) {
+				discardDecoder(created)
 				onImageEventListeners.onImageLoadError(error)
+			}
+		}
+	}
+
+	/** Releases a decoder that was never handed to the view, off the main thread. */
+	private fun discardDecoder(unused: ImageRegionDecoder?) {
+		if (unused == null) return
+		TileDecodeDispatcher.cleanup.execute {
+			try {
+				unused.recycle()
+			} catch (_: Exception) {
+				// nothing left to release
 			}
 		}
 	}
@@ -1877,8 +1955,13 @@ public open class SubsamplingScaleImageView @JvmOverloads constructor(
 					// onTileLoaded() so the current draw frame can finish safely.
 					val oldBitmap = tile.bitmap
 					tile.bitmap = decodedBitmap
+					if (decodedBitmap != null) {
+						val px = decodedBitmap.width.toLong() * decodedBitmap.height
+						if (px > 0) observedBytesPerPixel = (decodedBitmap.byteCount / px).toInt()
+					}
 					tile.isValid = true
 					tile.isLoading = false
+					tile.failCount = 0
 					onTileLoaded()
 					oldBitmap?.recycle()
 					TileMemory.enforce(tileBudgetBytes)
@@ -1896,7 +1979,11 @@ public open class SubsamplingScaleImageView @JvmOverloads constructor(
 				throw e
 			} catch (error: Throwable) {
 				produced?.recycle()
-				if (tile.epoch == capturedEpoch) tile.isLoading = false
+				if (tile.epoch == capturedEpoch) {
+					tile.isLoading = false
+					tile.failCount++
+					tile.failedAt = SystemClock.uptimeMillis()
+				}
 				onImageEventListeners.onTileLoadError(error)
 			}
 		}
@@ -2009,6 +2096,10 @@ public open class SubsamplingScaleImageView @JvmOverloads constructor(
 		val ready = width > 0 && height > 0 && sWidth > 0 && sHeight > 0 && (bitmap != null || isBaseLayerReady())
 		if (!isReadySent && ready) {
 			preDraw()
+			// The first scale exists only now (preDraw fits the image to the view). The refresh made when
+			// the base layer was set up ran with scale 0, so it asked for no detail tiles and nothing else
+			// would until the next touch or redraw: the page stayed as blurry as its base layer.
+			refreshRequiredTiles(load = true)
 			isReadySent = true
 			onReady()
 			onImageEventListeners.onReady()
@@ -2101,10 +2192,18 @@ public open class SubsamplingScaleImageView @JvmOverloads constructor(
 	}
 
 	@JvmSynthetic
-	internal fun limitedScale(targetScale: Float): Float = minOf(maxScale, maxOf(minScale(), targetScale))
+	internal fun limitedScale(targetScale: Float): Float {
+		// The fit scale wins when a stale maximum (left by the previous page of a reused view) is below it:
+		// the page must never be drawn smaller than its fit, with bars all around.
+		val min = minScale()
+		// Before the image size is known the fit is Infinity or NaN: the maximum alone limits then, as before.
+		if (!min.isFinite()) return minOf(maxScale, maxOf(min, targetScale))
+		return maxOf(min, minOf(maxScale, targetScale))
+	}
 
 	@JvmSynthetic
 	internal fun doubleTapZoom(sCenter: PointF, vFocus: PointF) {
+		if (!isDoubleTapZoomEnabled) return
 		if (!isPanEnabled) {
 			sRequestedCenter?.let {
 				sCenter.x = it.x
@@ -2230,7 +2329,7 @@ public open class SubsamplingScaleImageView @JvmOverloads constructor(
 			vTranslateBefore = PointF(0f, 0f)
 		}
 		vTranslateBefore!!.set(vTranslate!!)
-		var scaleElapsed = System.currentTimeMillis() - animation.time
+		var scaleElapsed = SystemClock.uptimeMillis() - animation.time
 		val finished = scaleElapsed > animation.duration
 		scaleElapsed = min(scaleElapsed, animation.duration)
 		scale = animation.interpolate(
@@ -2313,7 +2412,7 @@ public open class SubsamplingScaleImageView @JvmOverloads constructor(
 				isFilterBitmap = true
 				// isDither: Android's ordered (Bayer 4×4) dithering. In HWUI (hardware
 				// rendering) this flag is ignored on API 26+. In software rendering it reduces
-				// colour banding when the tile bitmap is RGB_565 or the target surface is lower
+				// color banding when the tile bitmap is RGB_565 or the target surface is lower
 				// than 8-bit per channel. Keeping it true covers the software fallback path.
 				isDither = true
 				isAntiAlias = true // No effect on drawBitmap, but kept for subclass paint reuse.
@@ -2396,7 +2495,7 @@ public open class SubsamplingScaleImageView @JvmOverloads constructor(
 		KeyEvent.KEYCODE_DPAD_CENTER,
 		-> isZoomEnabled && isScaled()
 
-		else -> super.onKeyDown(keyCode, event)
+		else -> super.onKeyUp(keyCode, event)
 	}
 
 	override fun onGenericMotionEvent(event: MotionEvent): Boolean {
@@ -2407,10 +2506,12 @@ public open class SubsamplingScaleImageView @JvmOverloads constructor(
 					if (!isZoomEnabled) {
 						return super.onGenericMotionEvent(event)
 					}
-					val center = PointF(event.x, event.y)
-					val d = event.getAxisValue(MotionEvent.AXIS_VSCROLL) *
-						ViewConfigurationCompat.getScaledVerticalScrollFactor(viewConfig, context)
-					(animateScaleAndCenter(scale + d, center) ?: return false)
+					val notches = event.getAxisValue(MotionEvent.AXIS_VSCROLL)
+					if (notches == 0f) return super.onGenericMotionEvent(event)
+					// animateScaleAndCenter wants SOURCE coordinates; one wheel notch is a 10 % step (the old additive
+					// step of ~50 hit the min/max scale on the first notch).
+					val center = viewToSourceCoord(event.x, event.y) ?: return false
+					(animateScaleAndCenter(scale * 1.1f.pow(notches), center) ?: return false)
 						.withInterpolator(DecelerateInterpolator())
 						.withDuration(resources.getInteger(android.R.integer.config_shortAnimTime).toLong())
 						.start()

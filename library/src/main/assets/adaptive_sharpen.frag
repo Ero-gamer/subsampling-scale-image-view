@@ -19,7 +19,7 @@
 // STRICT LIABILITY, OR TORT (INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT OF THE
 // USE OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
 //
-// Input: the RGBA16F texture written by adaptive_edge.frag (rgb = colour, a = edge strength).
+// Input: the RGBA16F texture written by adaptive_edge.frag (rgb = color, a = edge strength).
 // Differences from the original (all deliberate, none change the maths):
 //  - the edge value is stored WITHOUT the original's +2.0 offset (a_offset), so every
 //    "x - a_offset" of the original is simply "x" here; the offset only existed to detect a
@@ -64,7 +64,7 @@ float soft_lim(float v, float s) {
 float wpmean(float a, float b, float w) {
     return pow(w * pow(abs(a), pm_p) + abs(1.0 - w) * pow(abs(b), pm_p), 1.0 / pm_p);
 }
-// Colour to luma, fast approx gamma, avg of rec. 709 & 601 luma coeffs
+// Color to luma, fast approx gamma, avg of rec. 709 & 601 luma coeffs
 float CtL(vec3 rgb) {
     return sqrt(dot(vec3(0.2558, 0.6511, 0.0931), clamp(rgb * abs(rgb), 0.0, 1.0)));
 }

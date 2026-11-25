@@ -7,28 +7,30 @@ internal class CompositeImageEventListener : OnImageEventListener {
 	private var listeners: MutableList<OnImageEventListener>? = null
 
 	override fun onReady() {
-		listeners?.forEach { it.onReady() }
+		snapshot()?.forEach { it.onReady() }
 	}
 
 	override fun onImageLoaded() {
-		listeners?.forEach { it.onImageLoaded() }
+		snapshot()?.forEach { it.onImageLoaded() }
 	}
 
 	override fun onPreviewLoadError(e: Throwable) {
-		listeners?.forEach { it.onPreviewLoadError(e) }
+		snapshot()?.forEach { it.onPreviewLoadError(e) }
 	}
 
 	override fun onImageLoadError(e: Throwable) {
-		listeners?.forEach { it.onImageLoadError(e) }
+		snapshot()?.forEach { it.onImageLoadError(e) }
 	}
 
 	override fun onTileLoadError(e: Throwable) {
-		listeners?.forEach { it.onTileLoadError(e) }
+		snapshot()?.forEach { it.onTileLoadError(e) }
 	}
 
 	override fun onPreviewReleased() {
-		listeners?.forEach { it.onPreviewReleased() }
+		snapshot()?.forEach { it.onPreviewReleased() }
 	}
+
+	private fun snapshot(): List<OnImageEventListener>? = listeners?.toList()
 
 	fun addListener(listener: OnImageEventListener) {
 		listeners?.add(listener) ?: run {

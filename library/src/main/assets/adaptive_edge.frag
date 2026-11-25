@@ -3,7 +3,7 @@
 // 2018-04-14, "Adaptive-sharpen - Pass one.hlsl" (BSD-2-Clause, Copyright (c) 2015-2018,
 // bacondither; licence text is reproduced in adaptive_sharpen.frag).
 //
-// Output: rgb = the input colour, a = edge strength * contrast compression. It is written to an
+// Output: rgb = the input color, a = edge strength * contrast compression. It is written to an
 // RGBA16F target (edge strengths exceed 1.0). The original adds a_offset = 2.0 to the edge value;
 // this port stores it without the offset and adaptive_sharpen.frag is written for that.
 precision highp float;
@@ -57,5 +57,5 @@ void main() {
            + 0.23 * (abs(blur - c9) + abs(blur - c10) + abs(blur - c11) + abs(blur - c12));
     float edge = length(e);
 
-    fragColor = vec4(texture(u_texture, v_texCoord).rgb, edge * c_comp);
+    fragColor = vec4(c0, edge * c_comp);
 }

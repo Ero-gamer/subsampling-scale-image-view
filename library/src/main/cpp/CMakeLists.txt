@@ -3,7 +3,11 @@ project(ssiv_jpeg_decoder)
 
 include(ExternalProject)
 
-# ── libjpeg-turbo 3.2.0 ────────────────────────────────────────────────────
+# A missing/failed SIMD setup must fail the build instead of silently producing the slow scalar
+# library (libjpeg-turbo otherwise falls back without a word). Only arm64-v8a / armeabi-v7a are built.
+set(LJPEG_REQUIRE_SIMD "-DREQUIRE_SIMD=1")
+
+# ── libjpeg-turbo 3.2.1 ────────────────────────────────────────────────────
 # FetchContent / add_subdirectory() are explicitly blocked by libjpeg-turbo's
 # own CMakeLists.txt. ExternalProject_Add builds it in a fully isolated
 # sub-build so it never gets included as a subdirectory.
@@ -14,8 +18,8 @@ set(LJPEG_LIB         "${LJPEG_INSTALL_DIR}/lib/libturbojpeg.a")
 
 ExternalProject_Add(libjpeg_turbo_ext
     PREFIX      "${LJPEG_PREFIX}"
-    URL         https://github.com/libjpeg-turbo/libjpeg-turbo/releases/download/3.2.0/libjpeg-turbo-3.2.0.tar.gz
-    URL_HASH    SHA256=6f30092cef9fb839779646608f4ee14ae3cbac989c47fa05e841b0841f09878e
+    URL         https://github.com/libjpeg-turbo/libjpeg-turbo/releases/download/3.2.1/libjpeg-turbo-3.2.1.tar.gz
+    URL_HASH    SHA256=c27ad72a68da151177929aa969ae773a2da5ac2af9ce946079314fdac8cece7f
 
     CMAKE_ARGS
         # Android cross-compilation — forward every variable AGP passes to us
@@ -33,6 +37,7 @@ ExternalProject_Add(libjpeg_turbo_ext
         -DENABLE_SHARED=OFF
         -DENABLE_STATIC=ON
         -DWITH_SIMD=ON
+        ${LJPEG_REQUIRE_SIMD}
         -DWITH_TURBOJPEG=ON
         -DWITH_JAVA=OFF
         -DWITH_JPEG8=ON
@@ -75,7 +80,14 @@ target_link_libraries(ssiv_jpeg_decoder
 )
 
 # 16 KB page-size compatible ELF segments (Android 15+ devices), smaller and faster-loading library.
-target_compile_options(ssiv_jpeg_decoder PRIVATE -O2 -fvisibility=hidden -ffunction-sections -fdata-sections)
+target_compile_options(ssiv_jpeg_decoder PRIVATE -O2 -fvisibility=hidden -ffunction-sections -fdata-sections -fno-exceptions -fno-rtti)
+
+# Thin LTO for release builds when the toolchain supports it.
+include(CheckIPOSupported)
+check_ipo_supported(RESULT ssiv_ipo_ok OUTPUT ssiv_ipo_msg LANGUAGES C CXX)
+if(ssiv_ipo_ok AND CMAKE_BUILD_TYPE STREQUAL "Release")
+    set_property(TARGET ssiv_jpeg_decoder PROPERTY INTERPROCEDURAL_OPTIMIZATION TRUE)
+endif()
 # --exclude-libs hides the static libjpeg-turbo symbols; --icf=safe folds identical code (lld, NDK default).
 target_link_options(ssiv_jpeg_decoder PRIVATE
     -Wl,-z,max-page-size=16384

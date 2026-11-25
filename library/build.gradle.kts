@@ -2,8 +2,7 @@ import org.jetbrains.kotlin.gradle.dsl.JvmTarget
 
 plugins {
     id("com.android.library")
-    id("kotlin-android")
-    id("kotlin-parcelize")
+    id("org.jetbrains.kotlin.plugin.parcelize")
     id("maven-publish")
 }
 
@@ -15,7 +14,7 @@ base {
 }
 
 android {
-    compileSdk = 35
+    compileSdk = 37
     namespace = "com.davemorrissey.labs.subscaleview"
 
     // This must be INSIDE the android block
@@ -28,13 +27,12 @@ android {
         consumerProguardFiles("proguard-rules.txt")
     }
 
-    // targetSdk on defaultConfig is deprecated for library modules (removed in AGP 9.0) —
-    // it only ever affected the test APK and lint's target, so those are now set explicitly.
+    // targetSdk on defaultConfig is gone for library modules (AGP 9): set it for tests and lint.
     testOptions {
-        targetSdk = 35
+        targetSdk = 37
     }
     lint {
-        targetSdk = 35
+        targetSdk = 37
     }
 
     compileOptions {
@@ -61,8 +59,7 @@ android {
             cmake {
                 // arm64-v8a: modern 64-bit Android (NEON SIMD enabled)
                 // armeabi-v7a: 32-bit ARM fallback
-                // x86_64: emulator support
-                abiFilters += listOf("arm64-v8a", "armeabi-v7a", "x86_64")
+                abiFilters += listOf("arm64-v8a", "armeabi-v7a")
                 // Lets NDK r27+ produce 16 KB page-size aligned libraries (ignored by older NDKs).
                 arguments += "-DANDROID_SUPPORT_FLEXIBLE_PAGE_SIZES=ON"
             }
@@ -70,7 +67,6 @@ android {
     }
 } // This brace correctly closes the android block
 
-// kotlinOptions{} is deprecated (removed in AGP 9.0) — migrated to the compilerOptions DSL.
 kotlin {
     compilerOptions {
         jvmTarget.set(JvmTarget.JVM_17)
@@ -83,12 +79,13 @@ val javadocs by configurations.creating
 dependencies {
     implementation("org.jetbrains.kotlin:kotlin-stdlib:2.4.21")
     implementation("androidx.customview:customview:1.2.0")
-    javadocs("androidx.annotation:annotation:1.10.0")
+    javadocs("androidx.annotation:annotation:1.11.0")
     javadocs("androidx.exifinterface:exifinterface:1.4.2")
-    implementation("androidx.annotation:annotation:1.10.0")
+    implementation("androidx.annotation:annotation:1.11.0")
     implementation("androidx.exifinterface:exifinterface:1.4.2")
-    implementation("androidx.lifecycle:lifecycle-runtime-ktx:2.11.0")
+    implementation("androidx.lifecycle:lifecycle-runtime-ktx:2.11.1")
     implementation("org.jetbrains.kotlinx:kotlinx-coroutines-android:1.11.0")
+    testImplementation("junit:junit:4.13.2")
 }
 
 afterEvaluate {
@@ -104,16 +101,11 @@ afterEvaluate {
     }
 }
 
-// Cleaned up Javadoc task to prevent "Unexpected input" errors
+// Cleaned up Javadoc task to prevent "Unexpected input" errors.
+// AGP 9 new DSL: no android.bootClasspath / sourceSets srcDirs here, so use the plain source tree
+// and the SDK boot classpath from androidComponents.
 tasks.register<Javadoc>("javadoc") {
     isFailOnError = false
-    // android.sourceSets["main"].java is AGP's AndroidSourceDirectorySet, which is NOT a
-    // Gradle FileTree in this AGP version's API surface (assigning it directly fails with
-    // "Type mismatch: inferred type is AndroidSourceDirectorySet but FileTree! was expected"),
-    // and it does not expose a `.sourceFiles` member either (the original script's error:
-    // "Unresolved reference: sourceFiles"). `srcDirs` (a Set<File>) is the one member present
-    // on every AndroidSourceDirectorySet variant across AGP versions, so build the FileTree
-    // from that explicitly instead of relying on either interface's extra members.
-    source = files(android.sourceSets.getByName("main").java.srcDirs).asFileTree
-    classpath += project.files(android.bootClasspath.joinToString(File.pathSeparator))
+    source = fileTree("src/main/java")
+    classpath += files(androidComponents.sdkComponents.bootClasspath)
 }

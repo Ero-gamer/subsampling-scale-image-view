@@ -45,6 +45,7 @@ uniform float u_range;       // banding detection range in pixels; f3kdb's own d
                              // compressed webtoon gradients, less so on very slow, wide bands.
 uniform float u_threshold;   // 0..1 (already scaled from f3kdb's 0..255-ish range); default ~64/255
 uniform float u_grain;       // 0..1 grain amplitude
+uniform highp vec2 u_origin; // decoded-pixel position of this tile's (0,0) in the image: grain/distance stay continuous across tiles
 
 // Standard GLSL hash noise (Dave Hoskins' style single-iteration hash), not part of the ported
 // algorithm itself — just the per-pixel pseudo-random source the algorithm needs for the random
@@ -83,7 +84,7 @@ void main() {
     // Integer pixel coordinates: normalised v_texCoord differs by only ~1/width between
     // neighbouring pixels, which gives the hash almost no entropy (correlated, non-noisy
     // distance/grain). Whole-pixel coordinates decorrelate neighbours properly.
-    vec2 px = floor(v_texCoord / u_texelSize);
+    vec2 px = floor(v_texCoord / u_texelSize) + u_origin;
 
     // Per-pixel random square half-size in [1, u_range] (rounded to whole texels, matching the
     // original's integer-pixel reference distance).
@@ -99,8 +100,11 @@ void main() {
 
     // blur_first=true (f3kdb's own default): compare against the average, not each reference
     // individually.
+    // One decision for all channels (max difference): per-channel steps would blend only some channels
+    // of a pixel and leave coloured fringes.
     vec3 diff = abs(c - avg);
-    vec3 result = mix(c, avg, step(diff, vec3(u_threshold)));
+    float maxDiff = max(diff.r, max(diff.g, diff.b));
+    vec3 result = mix(c, avg, step(maxDiff, u_threshold));
 
     // Grain: small symmetric per-pixel noise, added only after the conditional average (matches
     // "optional dithered grain added after, as its final stage").

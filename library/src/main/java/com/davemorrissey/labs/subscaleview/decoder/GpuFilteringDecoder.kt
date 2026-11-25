@@ -17,7 +17,7 @@ import androidx.annotation.WorkerThread
  * Adaptive-Sharpen) sample neighbouring pixels. Each tile is decoded independently, so without
  * this a kernel near a tile's edge would sample [android.opengl.GLES30.GL_CLAMP_TO_EDGE]
  * duplicates of its own border instead of the real image content just past it — a visible seam
- * at every tile boundary, worst on smooth colour gradients (webtoon/manhwa backgrounds) where a
+ * at every tile boundary, worst on smooth color gradients (webtoon/manhwa backgrounds) where a
  * 1-2px discontinuity is far more visible than on white manga paper. [decodeRegion] decodes
  * [APRON_PX] extra pixels of real image content on every side (clamped at the true image edges,
  * where [GLES30.GL_CLAMP_TO_EDGE] is in fact correct — there is no neighbour to sample), runs the
@@ -40,7 +40,7 @@ import androidx.annotation.WorkerThread
  * autocorrelation-based periodicity check on one cheap downsampled thumbnail per image (not per
  * tile), once, in [init] — negligible cost next to a single full-resolution tile decode — and
  * the result CAPS (never disables) [renderer]'s effective RCAS/Adaptive-Sharpen intensity for
- * every tile of that image. Smooth colour art and photographic content score far below the
+ * every tile of that image. Smooth color art and photographic content score far below the
  * detection threshold and are unaffected (see that file's doc for the verification notes).
  *
  * **What this does NOT replace:** Brightness, Contrast, and Saturation remain as CPU/Canvas
@@ -92,7 +92,7 @@ public class GpuFilteringDecoder(
 			}
 		}
 
-	/** Downsamples the WHOLE image to roughly [THUMBNAIL_TARGET_PX] on its shorter side (one
+	/** Downsamples the image (central square for tall/wide strips) to roughly [THUMBNAIL_TARGET_PX] on its shorter side (one
 	 *  cheap decode, negligible next to a single full-resolution tile) and scores it for
 	 *  screentone periodicity. */
 	private fun computeSharpenCap(
@@ -102,7 +102,20 @@ public class GpuFilteringDecoder(
 		if (imgW <= 0 || imgH <= 0) return 1f
 		val shortSide = minOf(imgW, imgH)
 		val sampleSize = Integer.highestOneBit(maxOf(1, shortSide / THUMBNAIL_TARGET_PX))
-		val thumb = inner.decodeRegion(Rect(0, 0, imgW, imgH), sampleSize)
+		// Screentone is local: a tall strip (webtoon) is analysed on its central square only, so init does not
+		// entropy-decode the whole file. Normal pages (long side <= 2x short side) keep the whole image.
+		val longSide = maxOf(imgW, imgH)
+		val region =
+			if (longSide <= shortSide * 2) {
+				Rect(0, 0, imgW, imgH)
+			} else if (imgH > imgW) {
+				val top = (imgH - shortSide) / 2
+				Rect(0, top, imgW, top + shortSide)
+			} else {
+				val left = (imgW - shortSide) / 2
+				Rect(left, 0, left + shortSide, imgH)
+			}
+		val thumb = inner.decodeRegion(region, sampleSize)
 		return try {
 			val score = ScreentonePeriodicityDetector.detectPeriodicityScore(thumb)
 			ScreentonePeriodicityDetector.scoreToSharpenCap(score)
@@ -123,7 +136,7 @@ public class GpuFilteringDecoder(
 		// Apron in SOURCE pixels: APRON_PX decoded pixels of real neighbouring content on each
 		// side, scaled up by sampleSize since sRect is in full-resolution source coordinates but
 		// the apron budget (kernel radius) is in already-downsampled decoded-pixel units.
-		val apronSrc = APRON_PX * sampleSize
+		val apronSrc = renderer.requiredApronPx() * sampleSize
 		val imgW = imageWidth
 		val imgH = imageHeight
 		val padded =
@@ -147,7 +160,7 @@ public class GpuFilteringDecoder(
 			// side, so this is derived from the padded rect's own decoded size, not by assuming
 			// a fixed ratio.
 			val cropRect = if (padded == sRect) null else cropWithin(tile, padded, sRect)
-			val filtered = renderer.applyFilter(tile, cropRect, sharpenCap)
+			val filtered = renderer.applyFilter(tile, cropRect, sharpenCap, padded.left / maxOf(1, sampleSize), padded.top / maxOf(1, sampleSize))
 			// Renderer returned a new bitmap — recycle the intermediate padded-tile allocation.
 			if (filtered !== tile) tile.recycle()
 			filtered
@@ -198,11 +211,10 @@ public class GpuFilteringDecoder(
 	}
 
 	private companion object {
-		// Largest kernel radius among the filter chain, in already-decoded pixels: the
-		// Adaptive-Sharpen edge pass's 25-tap pattern reaches offsets up to magnitude 3
-		// (see adaptive_edge.frag), so 3 would be exactly enough; +1 for headroom against any
-		// future kernel and to absorb the sub-pixel rounding a sampleSize division can introduce.
-		const val APRON_PX = 4
+		// Upper bound of the summed kernel reach of the whole chain, in decoded pixels (deband 4 +
+		// denoise/darken 1 + RCAS 1 + adaptive-sharpen 5 + binarize 3 = 14). The apron actually used
+		// is GpuTileRenderer.requiredApronPx(): the sum over the ENABLED stages only.
+		const val APRON_PX = 14
 
 		// Target size (px, shorter side) for the one-shot screentone-periodicity thumbnail —
 		// small enough to be essentially free next to a full-resolution tile decode, large
@@ -227,6 +239,8 @@ public class GpuFilteringDecoder(
 		enableAdaptiveSharpen: Boolean = false,
 		adaptiveSharpenIntensity: Float = 0f,
 		enableScreentoneCap: Boolean = true,
+		enableBinarize: Boolean = false,
+		binarizeStrength: Float = 1f,
 		// The renderer is shared across all decoder instances produced by this factory so the
 		// EGL context is created once per SSIV image load, not once per tile decode worker.
 		// Public (not internal): app code in a separate module reads/reuses this renderer
@@ -246,6 +260,8 @@ public class GpuFilteringDecoder(
 			renderer.enableAdaptiveSharpen = enableAdaptiveSharpen
 			renderer.adaptiveSharpenIntensity = adaptiveSharpenIntensity
 			renderer.enableScreentoneCap = enableScreentoneCap
+			renderer.enableBinarize = enableBinarize
+			renderer.binarizeStrength = binarizeStrength
 		}
 
 		override val bitmapConfig: Bitmap.Config? get() = innerFactory.bitmapConfig

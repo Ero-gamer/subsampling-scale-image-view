@@ -22,7 +22,15 @@ struct ThreadHandle {
     }
 
     tjhandle get() {
-        if (!h) h = tj3Init(TJINIT_DECOMPRESS);
+        if (!h) {
+            h = tj3Init(TJINIT_DECOMPRESS);
+            if (h) {
+                // Hardening against crafted files: a progressive JPEG with thousands of scans, or absurd
+                // dimensions, would burn CPU / memory for every tile. A refusal falls back to the system decoder.
+                tj3Set(h, TJPARAM_SCANLIMIT, 500);
+                tj3Set(h, TJPARAM_MAXPIXELS, 400 * 1000 * 1000);
+            }
+        }
         return h;
     }
 
@@ -35,11 +43,18 @@ struct ThreadHandle {
 
 thread_local ThreadHandle tls_handle;
 
+/**
+ * TurboJPEG 3 reports a recoverable WARNING (extraneous bytes, premature end of data, a bad EOI) by returning -1 even
+ * though the output was produced. Only a fatal error is a failure: a slightly damaged or truncated file keeps its
+ * tiles, as it does with the system decoder.
+ */
+inline bool is_fatal(tjhandle tj) { return tj3GetErrorCode(tj) != TJERR_WARNING; }
+
 bool parse_header(JpegSource *src) {
     if (src->size < 4 || src->data[0] != 0xFF || src->data[1] != 0xD8 || src->data[2] != 0xFF) return false;
     tjhandle tj = tls_handle.get();
     if (!tj) return false;
-    if (tj3DecompressHeader(tj, src->data, src->size) != 0) {
+    if (tj3DecompressHeader(tj, src->data, src->size) != 0 && is_fatal(tj)) {
         tls_handle.reset();
         return false;
     }
@@ -47,17 +62,31 @@ bool parse_header(JpegSource *src) {
     src->height = tj3Get(tj, TJPARAM_JPEGHEIGHT);
     src->subsamp = tj3Get(tj, TJPARAM_SUBSAMP);
     src->progressive = tj3Get(tj, TJPARAM_PROGRESSIVE) ? 1 : 0;
+    // libjpeg(-turbo) has no CMYK/YCCK -> RGB conversion: every tile would fail inside tj3Decompress8. Refuse the
+    // file here so the caller goes straight to the system decoder, which converts CMYK (incl. Adobe-inverted) itself.
+    // ICC profiles are ignored on this path (raw values), the same as for untagged files.
+    const int cs = tj3Get(tj, TJPARAM_COLORSPACE);
+    if (cs == TJCS_CMYK || cs == TJCS_YCCK) {
+        tls_handle.reset();
+        return false;
+    }
+    // An unusual chroma subsampling cannot be decoded through a cropping region (every tile would fail in
+    // tj3SetCroppingRegion): leave it to the system decoder from the start.
+    if (src->subsamp < 0) {
+        tls_handle.reset();
+        return false;
+    }
     return src->width > 0 && src->height > 0 && tj3Get(tj, TJPARAM_PRECISION) == 8;
 }
 
 tjscalingfactor pick_scale(int sample_size) {
     int n = 0;
     const tjscalingfactor *factors = tj3GetScalingFactors(&n);
-    const double target = 1.0 / (double) sample_size;
+    const double target = 1.0 / (double)sample_size;
     tjscalingfactor best = {1, sample_size};
     double best_val = 0.0;
     for (int i = 0; i < n; i++) {
-        const double v = (double) factors[i].num / (double) factors[i].denom;
+        const double v = (double)factors[i].num / (double)factors[i].denom;
         if (v <= target + 1e-9 && v > best_val) {
             best_val = v;
             best = factors[i];
@@ -87,18 +116,18 @@ JpegSource *jpeg_open_fd(int fd, int64_t offset, int64_t length) {
     if (fd < 0 || offset < 0 || length < 4) return nullptr;
     const long page = sysconf(_SC_PAGESIZE) > 0 ? sysconf(_SC_PAGESIZE) : 4096;
     const int64_t delta = offset % page;
-    const size_t map_len = (size_t) (length + delta);
-    void *base = mmap(nullptr, map_len, PROT_READ, MAP_PRIVATE, fd, (off_t) (offset - delta));
+    const size_t map_len = (size_t)(length + delta);
+    void *base = mmap(nullptr, map_len, PROT_READ, MAP_PRIVATE, fd, (off_t)(offset - delta));
     if (base == MAP_FAILED) return nullptr;
     JpegSource *src = new (std::nothrow) JpegSource();
     if (!src) {
         munmap(base, map_len);
         return nullptr;
     }
-    src->map_base = (uint8_t *) base;
+    src->map_base = (uint8_t *)base;
     src->map_len = map_len;
-    src->data = (const uint8_t *) base + delta;
-    src->size = (size_t) length;
+    src->data = (const uint8_t *)base + delta;
+    src->size = (size_t)length;
     if (!parse_header(src)) {
         munmap(base, map_len);
         delete src;
@@ -128,8 +157,9 @@ bool jpeg_plan(const JpegSource *src, int sample_size, int left, int top, int ri
     const int mcu_w = (ss == TJSAMP_444 || ss == TJSAMP_GRAY || ss == TJSAMP_440) ? 8 : 16;
     const int mcu_h = (ss == TJSAMP_420 || ss == TJSAMP_440) ? 16 : 8;
     // Use the largest MCU for both axes only when the sampling is unusual (411/441): always safe.
-    const int mw = (ss == TJSAMP_411 || ss == TJSAMP_441) ? 32 : mcu_w;
-    const int mh = (ss == TJSAMP_411 || ss == TJSAMP_441) ? 32 : mcu_h;
+    // (an unknown sampling, ss < 0, is refused in parse_header; it gets the safe size here too)
+    const int mw = (ss == TJSAMP_411 || ss == TJSAMP_441 || ss < 0) ? 32 : mcu_w;
+    const int mh = (ss == TJSAMP_411 || ss == TJSAMP_441 || ss < 0) ? 32 : mcu_h;
 
     int al = (left / mw) * mw;
     int at = (top / mh) * mh;
@@ -145,16 +175,16 @@ bool jpeg_plan(const JpegSource *src, int sample_size, int left, int top, int ri
     plan->crop_h = ab - at;
     plan->num = sf.num;
     plan->denom = sf.denom;
-    plan->out_w = (int) std::ceil((double) plan->crop_w * sf.num / sf.denom);
-    plan->out_h = (int) std::ceil((double) plan->crop_h * sf.num / sf.denom);
+    plan->out_w = (int)std::ceil((double)plan->crop_w * sf.num / sf.denom);
+    plan->out_h = (int)std::ceil((double)plan->crop_h * sf.num / sf.denom);
     if (plan->out_w < 1) plan->out_w = 1;
     if (plan->out_h < 1) plan->out_h = 1;
 
-    const double scale = (double) sf.num / sf.denom;
-    int ix = (int) std::lround((left - al) * scale);
-    int iy = (int) std::lround((top - at) * scale);
-    int iw = (int) std::ceil((right - left) * scale);
-    int ih = (int) std::ceil((bottom - top) * scale);
+    const double scale = (double)sf.num / sf.denom;
+    int ix = (int)std::lround((left - al) * scale);
+    int iy = (int)std::lround((top - at) * scale);
+    int iw = (int)std::ceil((right - left) * scale);
+    int ih = (int)std::ceil((bottom - top) * scale);
     if (ix < 0) ix = 0;
     if (iy < 0) iy = 0;
     if (ix + iw > plan->out_w) iw = plan->out_w - ix;
@@ -171,9 +201,9 @@ bool jpeg_plan(const JpegSource *src, int sample_size, int left, int top, int ri
 
 int jpeg_decode(const JpegSource *src, const JpegPlan &plan, uint8_t *dst, size_t pitch) {
     tjhandle tj = tls_handle.get();
-    if (!tj || !src || !dst || pitch < (size_t) plan.out_w * 4) return -1;
+    if (!tj || !src || !dst || pitch < (size_t)plan.out_w * 4) return -1;
     // Header first: it (re)initialises the instance for this image, so a handle used for another page is safe.
-    if (tj3DecompressHeader(tj, src->data, src->size) != 0) {
+    if (tj3DecompressHeader(tj, src->data, src->size) != 0 && is_fatal(tj)) {
         tls_handle.reset();
         return -1;
     }
@@ -188,13 +218,13 @@ int jpeg_decode(const JpegSource *src, const JpegPlan &plan, uint8_t *dst, size_
         tls_handle.reset();
         return -1;
     }
-    tjregion region = {plan.aligned_left * plan.num / plan.denom, plan.aligned_top * plan.num / plan.denom,
-                       plan.out_w, plan.out_h};
+    tjregion region = {plan.aligned_left * plan.num / plan.denom, plan.aligned_top * plan.num / plan.denom, plan.out_w,
+                       plan.out_h};
     if (tj3SetCroppingRegion(tj, region) != 0) {
         tls_handle.reset();
         return -1;
     }
-    if (tj3Decompress8(tj, src->data, src->size, dst, (int) (pitch), TJPF_RGBA) != 0) {
+    if (tj3Decompress8(tj, src->data, src->size, dst, (int)(pitch), TJPF_RGBA) != 0 && is_fatal(tj)) {
         tls_handle.reset();
         return -1;
     }

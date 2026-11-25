@@ -485,7 +485,7 @@ void main() {
     vec2 samplePos = (gl_FragCoord.xy - u_dstOrigin) * u_invScale;
     vec4 r = resample(samplePos);
     // Negative outer-tap lobes (and the sigmoid round-trip's own float error) can still
-    // overshoot very slightly; keep a valid premultiplied colour.
+    // overshoot very slightly; keep a valid premultiplied color.
     r = clamp(r, 0.0, 1.0);
     r.rgb = min(r.rgb, r.aaa);
     fragColor = r;

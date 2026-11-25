@@ -21,6 +21,8 @@ internal object TileMemory {
 	private var projected = -1L
 
 	fun register(view: SubsamplingScaleImageView) {
+		// Pruned here as well: usedBytes() does not run while the budget is unlimited (the default).
+		views.removeAll { it.get() == null }
 		views.add(WeakReference(view))
 	}
 

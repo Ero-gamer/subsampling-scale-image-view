@@ -19,6 +19,10 @@ internal class TouchEventDelegate(
 	private val quickScaleThreshold: Float =
 		TypedValue.applyDimension(TypedValue.COMPLEX_UNIT_DIP, 20f, view.context.resources.displayMetrics)
 
+	// Never shorter than the historic 600 ms, longer when the user raised the system long-press timeout.
+	private val longClickDelayMs: Long =
+		maxOf(600L, android.view.ViewConfiguration.getLongPressTimeout().toLong())
+
 	// Max touches used in current gesture
 	private var maxTouchCount: Int = 0
 
@@ -76,7 +80,7 @@ internal class TouchEventDelegate(
 					view.vCenterStart!![event.x] = event.y
 
 					// Start long click timer
-					handler.sendEmptyMessageDelayed(MESSAGE_LONG_CLICK, 600)
+					handler.sendEmptyMessageDelayed(MESSAGE_LONG_CLICK, longClickDelayMs)
 				}
 				return true
 			}
@@ -323,6 +327,7 @@ internal class TouchEventDelegate(
 	}
 
 	fun reset() {
+		handler.removeMessages(MESSAGE_LONG_CLICK)
 		maxTouchCount = 0
 	}
 }

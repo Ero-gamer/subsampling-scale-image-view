@@ -76,6 +76,15 @@ internal object ScalerShaderSource {
 	/** Neighbourhood taps per axis above which [dpidSource] samples with a stride (see there). */
 	private const val DPID_MAX_TAPS = 16
 
+	/** A neighbourhood counts as grey when no tap differs by more than this per channel (12/255, as MangaJaNai). */
+	private const val GRAY_SPREAD = 12.0 / 255.0
+
+	/**
+	 * Transfer exponent of the "Dot Gain 20%" grey curve (print grey scans are encoded with it; it is within a
+	 * few percent of a plain 1.8 power law, which is what the shader uses so no LUT or piecewise code is needed).
+	 */
+	private const val DOT_GAIN_GAMMA = 1.8
+
 	/**
 	 * DPID — Detail-Preserving Image Downscaling (Weber, Waechter, Amend, Guthe, Goesele, SIGGRAPH
 	 * Asia 2016): `O[p] = sum_q I[q] * ||I[q] - G[p]||^lambda / sum_q ||I[q] - G[p]||^lambda`, where
@@ -106,6 +115,50 @@ internal object ScalerShaderSource {
 		val v4 = t.vec4
 		return """
 const int DPID_TAPS = $DPID_MAX_TAPS;
+const float GRAY_SPREAD = $GRAY_SPREAD;
+const float DOT_GAIN_GAMMA = $DOT_GAIN_GAMMA;
+float dotGainToLinear(float v) { return pow(max(v, 1e-6), DOT_GAIN_GAMMA); }
+float dotGainFromLinear(float l) { return pow(clamp(l, 1e-6, 1.0), 1.0 / DOT_GAIN_GAMMA); }
+
+/*
+ * Grey pages: the same detail-preserving average, but of linear light (decoded with the Dot Gain 20% curve and
+ * re-encoded with its inverse, so a 1:1 pass is the identity). Averaging screentone in gamma space darkens and
+ * keeps moire; in linear light the dots integrate to the right grey. Opaque neighbourhoods only (checked by the caller).
+ */
+$v4 dpidGray($f2 lo, $f2 hi, $f2 stride) {
+    float guide = 0.0;
+    float n = 0.0;
+    for (int j = 0; j < DPID_TAPS; j++) {
+        float y = lo.y + float(j) * stride.y;
+        if (y >= hi.y) break;
+        for (int i = 0; i < DPID_TAPS; i++) {
+            float x = lo.x + float(i) * stride.x;
+            if (x >= hi.x) break;
+            guide += dotGainToLinear(${fetch("$f2(x + 0.5, y + 0.5)")}.r);
+            n += 1.0;
+        }
+    }
+    guide /= n;
+
+    float acc = 0.0;
+    float k = 0.0;
+    for (int j = 0; j < DPID_TAPS; j++) {
+        float y = lo.y + float(j) * stride.y;
+        if (y >= hi.y) break;
+        for (int i = 0; i < DPID_TAPS; i++) {
+            float x = lo.x + float(i) * stride.x;
+            if (x >= hi.x) break;
+            float c = dotGainToLinear(${fetch("$f2(x + 0.5, y + 0.5)")}.r);
+            float d = c - guide;
+            float w = sqrt(sqrt(max(d * d, 1e-8)));
+            acc += c * w;
+            k += w;
+        }
+    }
+    float g = dotGainFromLinear(acc / k);
+    return $v4(g, g, g, 1.0);
+}
+
 $v4 dpid($f2 samplePos, $f2 boxScale, $f2 imgSize) {
     $f2 halfBox = 0.5 * boxScale;
     $f2 lo = clamp(floor(samplePos - halfBox), $f2(0.0), imgSize - 1.0);
@@ -114,16 +167,23 @@ $v4 dpid($f2 samplePos, $f2 boxScale, $f2 imgSize) {
 
     $f4 guide = $f4(0.0);
     float n = 0.0;
+    float spread = 0.0;
+    float minAlpha = 1.0;
     for (int j = 0; j < DPID_TAPS; j++) {
         float y = lo.y + float(j) * stride.y;
         if (y >= hi.y) break;
         for (int i = 0; i < DPID_TAPS; i++) {
             float x = lo.x + float(i) * stride.x;
             if (x >= hi.x) break;
-            guide += $f4(${fetch("$f2(x + 0.5, y + 0.5)")});
+            $f4 t = $f4(${fetch("$f2(x + 0.5, y + 0.5)")});
+            guide += t;
             n += 1.0;
+            spread = max(spread, max(t.r, max(t.g, t.b)) - min(t.r, min(t.g, t.b)));
+            minAlpha = min(minAlpha, t.a);
         }
     }
+    // Grey, opaque neighbourhood (manga page): resample in linear light, see dpidGray.
+    if (spread <= GRAY_SPREAD && minAlpha >= 0.999) return dpidGray(lo, hi, stride);
     guide /= n;
 
     $f4 acc = $f4(0.0);
@@ -153,7 +213,7 @@ $v4 dpid($f2 samplePos, $f2 boxScale, $f2 imgSize) {
 	 * those two: offset = 1/(1+exp(slope*center)), scale = 1/(1+exp(slope*(center-1))) - offset.
 	 * Verified: unsigmoidize(sigmoidize(x)) == x to double-precision float error for all x in
 	 * [0,1]. The true 4-neighbour anti-ring clamp (Qualcomm VK_QCOM_filter_cubic_clamp /
-	 * US 12,254,555 B2) blends the resampled colour toward being clamped to the min/max of the 4
+	 * US 12,254,555 B2) blends the resampled color toward being clamped to the min/max of the 4
 	 * texel centres immediately surrounding the sample point — not the further-out kernel taps,
 	 * which is what would actually cause ringing if left unclamped. 0.8 matches libplacebo/mpv's
 	 * common "antiring" default. Shared verbatim by every preset since it doesn't depend on B,C.
@@ -300,7 +360,7 @@ half4 main(float2 fragCoord) {
     float2 samplePos = (fragCoord - dstOrigin) * invScale;
     half4 r = bcCubic(samplePos, half($b), half($c));
     // Negative outer-tap lobes (and the sigmoid round-trip's own float error) can still
-    // overshoot very slightly; keep the result a valid premultiplied colour.
+    // overshoot very slightly; keep the result a valid premultiplied color.
     float4 rf = clamp(float4(r), 0.0, 1.0);
     rf.rgb = min(rf.rgb, rf.aaa);
     return half4(rf);

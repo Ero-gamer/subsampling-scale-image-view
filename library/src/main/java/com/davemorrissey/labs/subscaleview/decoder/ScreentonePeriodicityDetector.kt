@@ -8,7 +8,7 @@ import kotlin.math.sqrt
  * Detects periodic halftone/screentone patterns (the regular dot grids used in B&W manga
  * scans) on a small thumbnail, so [GpuFilteringDecoder] can CAP — not disable — sharpen
  * intensity on pages where sharpening or a non-integer-ratio resample would alias the dot
- * pattern into visible moiré. Smooth colour art (webtoon/manhwa gradients) and photographic
+ * pattern into visible moiré. Smooth color art (webtoon/manhwa gradients) and photographic
  * content are unaffected: they score far below the detection threshold (verified below).
  *
  * ### The technique: radial autocorrelation profile, oscillation-based
@@ -50,6 +50,9 @@ internal object ScreentonePeriodicityDetector {
      *  this CAPS, it does not disable, per the product decision this item was scoped to. */
     private const val MIN_CAP = 0.3f
 
+    /** Lags above this are sampled on a checkerboard of offsets (see [detectPeriodicityScore]). */
+    private const val SPARSE_FROM_LAG = 8
+
     /**
      * @param gray Row-major luma values, one float per pixel of the thumbnail (any reasonable
      *   size — 128x128 or so is plenty; this is deliberately run on a cheap downsampled
@@ -73,17 +76,25 @@ internal object ScreentonePeriodicityDetector {
         val profile = FloatArray(maxLag + 1)
         val counts = IntArray(maxLag + 1)
 
-        for (dy in -maxLag..maxLag) {
+        // corr(dx,dy) == corr(-dx,-dy) and both fall in the same lag bucket (same parity too), so the
+        // half-plane gives the identical radial profile at half the work.
+        for (dy in 0..maxLag) {
             for (dx in -maxLag..maxLag) {
-                if (dx == 0 && dy == 0) continue
+                if (dy == 0 && dx <= 0) continue
                 val lagF = sqrt((dx * dx + dy * dy).toDouble())
                 val lagI = round(lagF).toInt()
                 if (lagI < 1 || lagI > maxLag) continue
+                // Sparse sampling for long lags: half the offsets (checkerboard) keep the radial
+                // average statistically equivalent but cut the multiply-adds by about 40%.
+                if (lagI > SPARSE_FROM_LAG && ((dx + dy) and 1) != 0) continue
 
-                val (ys1, ye1, ys2, _) = if (dy >= 0) intArrayOf(0, height - dy, dy, height)
-                                          else intArrayOf(-dy, height, 0, height + dy)
-                val (xs1, xe1, xs2, _) = if (dx >= 0) intArrayOf(0, width - dx, dx, width)
-                                          else intArrayOf(-dx, width, 0, width + dx)
+                // dy >= 0 here. Overlap of the image with itself shifted by (dx,dy), no allocations.
+                val ys1 = 0
+                val ye1 = height - dy
+                val ys2 = dy
+                val xs1 = if (dx >= 0) 0 else -dx
+                val xe1 = if (dx >= 0) width - dx else width
+                val xs2 = if (dx >= 0) dx else 0
 
                 var corr = 0f
                 var row1 = ys1
@@ -140,7 +151,7 @@ internal object ScreentonePeriodicityDetector {
 
     /**
      * Maps a periodicity score to a sharpen-intensity multiplier in `[MIN_CAP, 1.0]`. Below
-     * [SCORE_THRESHOLD], no reduction at all (cap = 1.0) — smooth colour art and photographic
+     * [SCORE_THRESHOLD], no reduction at all (cap = 1.0) — smooth color art and photographic
      * content are essentially always in this range (verified <= 0.03 across several such test
      * cases, comfortably below the 0.10 threshold). From there it ramps linearly down to
      * [MIN_CAP] by [SCORE_AT_FLOOR], which real detected screentone comfortably exceeds.
@@ -151,9 +162,3 @@ internal object ScreentonePeriodicityDetector {
         return 1f - t * (1f - MIN_CAP)
     }
 }
-
-/** Destructuring support for the 4-element int arrays used as lightweight (a,b,c,d) tuples above. */
-private operator fun IntArray.component1() = this[0]
-private operator fun IntArray.component2() = this[1]
-private operator fun IntArray.component3() = this[2]
-private operator fun IntArray.component4() = this[3]

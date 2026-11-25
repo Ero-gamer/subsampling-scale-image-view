@@ -3,6 +3,7 @@ package com.davemorrissey.labs.subscaleview.internal
 import android.graphics.Bitmap
 import android.graphics.Rect
 import android.graphics.RectF
+import android.os.SystemClock
 
 /**
  * A single tile in the tiled image grid.
@@ -85,8 +86,22 @@ internal class Tile {
      */
     fun intersects(r: RectF): Boolean = !(r.left > sRect.right || sRect.left > r.right || r.top > sRect.bottom || sRect.top > r.bottom)
 
+    /**
+     * Failed decodes since the last success / eviction / generation change. A tile that keeps failing is
+     * not re-queued on every refresh: after [MAX_FAILURES] it waits [RETRY_AFTER_MS] between attempts, so a
+     * transient failure (memory pressure, a busy file) never leaves it blank for good.
+     */
+    @JvmField
+    var failCount: Int = 0
+
+    /** Uptime (ms) of the last failed decode; only meaningful while [failCount] is above 0. */
+    @JvmField
+    var failedAt: Long = 0L
+
     /** True when this tile belongs to the target [sampleSize] level and has no valid bitmap or load in flight. */
-    fun needsLoad(sampleSize: Int): Boolean = this.sampleSize == sampleSize && !isLoading && (!isValid || bitmap == null)
+    fun needsLoad(sampleSize: Int): Boolean =
+        this.sampleSize == sampleSize && !isLoading && (!isValid || bitmap == null) &&
+            (failCount < MAX_FAILURES || SystemClock.uptimeMillis() - failedAt >= RETRY_AFTER_MS)
 
     /**
      * Recycles this tile's bitmap and resets state. **Must be called from the main thread.**
@@ -96,7 +111,14 @@ internal class Tile {
         isVisible = false
         isLoading = false
         isValid = false
+        failCount = 0
+        failedAt = 0L
         bitmap?.recycle()
         bitmap = null
+    }
+
+    companion object {
+        const val MAX_FAILURES = 2
+        const val RETRY_AFTER_MS = 3_000L
     }
 }

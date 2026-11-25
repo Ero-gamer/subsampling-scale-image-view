@@ -1,6 +1,7 @@
 package com.davemorrissey.labs.subscaleview
 
 import android.graphics.PointF
+import android.os.SystemClock
 import android.provider.Settings
 import android.util.Log
 import android.view.animation.AccelerateDecelerateInterpolator
@@ -153,7 +154,7 @@ public class AnimationBuilder internal constructor(
 			interruptible = isInterruptible,
 			interpolator = interpolator,
 			origin = origin,
-			time = System.currentTimeMillis(),
+			time = SystemClock.uptimeMillis(),
 			listener = listener,
 			vFocusEnd = if (vFocus != null) {
 				// Calculate where translation will be at the end of the anim

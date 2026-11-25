@@ -35,7 +35,8 @@ internal class Anim(
 ) {
 
 	fun interpolate(time: Long, from: Float, change: Float): Float {
-		val fraction = interpolator.getInterpolation(time.toFloat() / duration.toFloat())
+		// A zero duration (animations scaled to nothing) must not divide into NaN: it is simply finished.
+		val fraction = if (duration <= 0L) 1f else interpolator.getInterpolation(time.toFloat() / duration.toFloat())
 		return from + change * fraction
 	}
 }

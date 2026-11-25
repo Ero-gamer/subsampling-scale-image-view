@@ -92,29 +92,61 @@ internal class SettledScaler(
 		} // identity at integer offsets; smooth if a parent scales the view
 	private val settleRunnable = Runnable { settle() }
 
+	// The state a bake is already queued for: an unchanged state must not re-post the delayed bake every frame.
+	private val scheduled = Signature()
+	private var hasScheduled = false
+
+	// Frees the overlay (4 B/px of the view) after the view stayed ineligible for a while.
+	private var freePending = false
+	private val freeRunnable = Runnable {
+		freePending = false
+		freeOverlay()
+	}
+
 	/** Called from `onDraw` after the normal content was drawn. */
 	fun onDraw(
 		canvas: Canvas,
 		colorFilter: ColorFilter?,
 	) {
+		val bmp = overlay
+		// Mid-gesture with nothing baked there is nothing to show and a bake would be wasted: skip the
+		// signature work. The end of the gesture/animation invalidates, which comes back here.
+		if (host.isBusy() && !hasBaked) return
 		if (!host.fillSignature(current)) {
 			view.removeCallbacks(settleRunnable)
+			hasScheduled = false
+			if (bmp != null && !freePending) {
+				freePending = true
+				view.postDelayed(freeRunnable, OVERLAY_IDLE_MS)
+			}
 			return
 		}
-		val bmp = overlay
+		if (freePending) {
+			freePending = false
+			view.removeCallbacks(freeRunnable)
+		}
 		if (hasBaked && bmp != null && !bmp.isRecycled && current.sameAs(baked)) {
 			paint.colorFilter = colorFilter
 			canvas.drawBitmap(bmp, baked.visible.left.toFloat(), baked.visible.top.toFloat(), paint)
-		} else if (!(hasFailed && current.sameAs(failed))) {
+		} else if (!(hasFailed && current.sameAs(failed)) && !(hasScheduled && current.sameAs(scheduled))) {
+			scheduled.copyFrom(current)
+			hasScheduled = true
 			schedule()
 		}
 	}
 
-	fun release() {
-		view.removeCallbacks(settleRunnable)
+	private fun freeOverlay() {
 		overlay?.recycle()
 		overlay = null
 		hasBaked = false
+	}
+
+	fun release() {
+		view.removeCallbacks(settleRunnable)
+		view.removeCallbacks(freeRunnable)
+		freePending = false
+		hasScheduled = false
+		freeOverlay()
 		hasFailed = false
 		failureCount = 0
 		busyRetries = 0
@@ -128,6 +160,7 @@ internal class SettledScaler(
 	}
 
 	private fun settle() {
+		hasScheduled = false // fired: the next unchanged-state frame may queue again if this bake did not happen
 		if (!view.isAttachedToWindow) return
 		if (host.isBusy()) {
 			schedule()
@@ -195,9 +228,21 @@ internal class SettledScaler(
 	): Bitmap? {
 		val existing = overlay
 		if (existing != null && !existing.isRecycled && existing.width == w && existing.height == h) return existing
+		hasBaked = false
+		// Only the size changed (e.g. a webtoon page that is partly visible): reuse the pixel memory.
+		// The renderer overwrites every pixel (copyPixelsFromBuffer), so stale content cannot show.
+		if (existing != null && !existing.isRecycled && existing.isMutable &&
+			w.toLong() * h * 4 <= existing.allocationByteCount
+		) {
+			try {
+				existing.reconfigure(w, h, Bitmap.Config.ARGB_8888)
+				return existing
+			} catch (_: IllegalArgumentException) {
+				// fall through to a fresh allocation
+			}
+		}
 		existing?.recycle()
 		overlay = null
-		hasBaked = false
 		return try {
 			Bitmap.createBitmap(w, h, Bitmap.Config.ARGB_8888).also { overlay = it }
 		} catch (e: OutOfMemoryError) {
@@ -209,6 +254,7 @@ internal class SettledScaler(
 		/** [BicubicRenderer]'s `u_mode` for the DPID downscaler (0-2 are the bicubic presets). */
 		const val MODE_DPID = 3
 		const val SETTLE_DELAY_MS = 140L
+		const val OVERLAY_IDLE_MS = 2000L
 		const val MAX_BUSY_RETRIES = 20
 		const val MAX_FAILURES = 3
 	}

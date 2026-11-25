@@ -75,7 +75,8 @@ internal fun getExifOrientation(context: Context, sourceUri: Uri): Int = runCatc
 			}
 		}
 
-		URI_SCHEME_ZIP -> {
+		URI_SCHEME_ZIP -> if (sourceUri.fragment.isJpegName()) {
+			// Opening the archive again re-reads its whole central directory; only JPEGs carry rotation in practice.
 			ZipFile(sourceUri.schemeSpecificPart).use { file ->
 				file.getEntry(sourceUri.fragment)?.let { entry ->
 					exifOrientation = file.getInputStream(entry).use {
@@ -89,6 +90,9 @@ internal fun getExifOrientation(context: Context, sourceUri: Uri): Int = runCatc
 }.onFailure { e ->
 	Log.w(SubsamplingScaleImageView.TAG, "Could not get EXIF orientation of image: $e")
 }.getOrDefault(SubsamplingScaleImageView.ORIENTATION_0)
+
+private fun String?.isJpegName(): Boolean = this != null &&
+	(endsWith(".jpg", ignoreCase = true) || endsWith(".jpeg", ignoreCase = true) || endsWith(".jpe", ignoreCase = true))
 
 @CheckResult
 private fun ExifInterface.getSsivOrientation(fallback: Int) = when (

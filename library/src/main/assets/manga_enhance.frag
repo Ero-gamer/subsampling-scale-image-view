@@ -41,6 +41,11 @@ void main() {
         vec3 c8 = texture(u_texture, v_texCoord + vec2( 0.0,  o.y)).rgb;
         vec3 c9 = texture(u_texture, v_texCoord + vec2( o.x,  o.y)).rgb;
 
+        // Neighbour luma computed once, shared by denoise and darken.
+        float l1 = getLuma(c1); float l2 = getLuma(c2); float l3 = getLuma(c3);
+        float l4 = getLuma(c4); float l6 = getLuma(c6); float l7 = getLuma(c7);
+        float l8 = getLuma(c8); float l9 = getLuma(c9);
+
         // Real bilateral filter (Tomasi & Manduchi, "Bilateral Filtering for Gray and Color
         // Images", ICCV 1998): BF(x) = (1/k(x)) * sum_y f(y) * Gs(||x-y||) * Gr(|I(x)-I(y)|),
         // where Gs/Gr are Gaussians on spatial distance and range (luma) difference. Range
@@ -62,34 +67,34 @@ void main() {
 
             float l5 = getLuma(color);
             float sigmaR = mix(0.03, 0.25, clamp(u_denoiseStrength, 0.0, 1.0));
-            float twoSigmaR2 = 2.0 * sigmaR * sigmaR;
+            float invTwoSigmaR2 = 1.0 / (2.0 * sigmaR * sigmaR);
 
             vec3 accum = color; // centre: spatial=1, range=1 (zero distance both ways)
             float wSum = 1.0;
             float d; float w;
 
-            d = getLuma(c1) - l5; w = SPATIAL_W_DIAG  * exp(-(d * d) / twoSigmaR2); accum += c1 * w; wSum += w;
-            d = getLuma(c2) - l5; w = SPATIAL_W_ORTHO * exp(-(d * d) / twoSigmaR2); accum += c2 * w; wSum += w;
-            d = getLuma(c3) - l5; w = SPATIAL_W_DIAG  * exp(-(d * d) / twoSigmaR2); accum += c3 * w; wSum += w;
-            d = getLuma(c4) - l5; w = SPATIAL_W_ORTHO * exp(-(d * d) / twoSigmaR2); accum += c4 * w; wSum += w;
-            d = getLuma(c6) - l5; w = SPATIAL_W_ORTHO * exp(-(d * d) / twoSigmaR2); accum += c6 * w; wSum += w;
-            d = getLuma(c7) - l5; w = SPATIAL_W_DIAG  * exp(-(d * d) / twoSigmaR2); accum += c7 * w; wSum += w;
-            d = getLuma(c8) - l5; w = SPATIAL_W_ORTHO * exp(-(d * d) / twoSigmaR2); accum += c8 * w; wSum += w;
-            d = getLuma(c9) - l5; w = SPATIAL_W_DIAG  * exp(-(d * d) / twoSigmaR2); accum += c9 * w; wSum += w;
+            d = l1 - l5; w = SPATIAL_W_DIAG  * exp(-(d * d) * invTwoSigmaR2); accum += c1 * w; wSum += w;
+            d = l2 - l5; w = SPATIAL_W_ORTHO * exp(-(d * d) * invTwoSigmaR2); accum += c2 * w; wSum += w;
+            d = l3 - l5; w = SPATIAL_W_DIAG  * exp(-(d * d) * invTwoSigmaR2); accum += c3 * w; wSum += w;
+            d = l4 - l5; w = SPATIAL_W_ORTHO * exp(-(d * d) * invTwoSigmaR2); accum += c4 * w; wSum += w;
+            d = l6 - l5; w = SPATIAL_W_ORTHO * exp(-(d * d) * invTwoSigmaR2); accum += c6 * w; wSum += w;
+            d = l7 - l5; w = SPATIAL_W_DIAG  * exp(-(d * d) * invTwoSigmaR2); accum += c7 * w; wSum += w;
+            d = l8 - l5; w = SPATIAL_W_ORTHO * exp(-(d * d) * invTwoSigmaR2); accum += c8 * w; wSum += w;
+            d = l9 - l5; w = SPATIAL_W_DIAG  * exp(-(d * d) * invTwoSigmaR2); accum += c9 * w; wSum += w;
 
             color = accum / wSum;
         }
 
         // Line darken (Anime4K-inspired heuristic, not the Anime4K algorithm): pulls dark
-        // pixels toward their darkest 8-neighbour below luma 0.6, capped at 35% blend.
+        // pixels toward their darkest 8-neighbour (or themselves if darker) below luma 0.6, capped at 35% blend.
         if (u_enableDarken) {
             float lumaC = getLuma(color);
-            float minLuma = min(min(min(getLuma(c1), getLuma(c2)), getLuma(c3)),
-                            min(min(getLuma(c4), getLuma(c6)),
-                                min(min(getLuma(c7), getLuma(c8)), getLuma(c9))));
+            float minLuma = min(min(min(l1, l2), l3), min(min(l4, l6), min(min(l7, l8), l9)));
+            // Include the centre: an isolated pixel darker than all neighbours must not be brightened.
+            float target = min(minLuma, lumaC);
             if (lumaC < 0.6) {
                 float darkenFactor = smoothstep(0.0, 0.6, lumaC);
-                color = mix(color, color * (minLuma / (lumaC + 0.001)),
+                color = mix(color, color * (target / (lumaC + 0.001)),
                             (1.0 - darkenFactor) * 0.35);
             }
         }
@@ -97,7 +102,7 @@ void main() {
 
     // Vibrance — SweetFX Vibrance.fx v1.1.1 by Christian Cann Schuldt Jensen ~ CeeJay.dk
     // (MIT licence, Copyright (c) 2014 CeeJayDK), RGB balance fixed at (1,1,1).
-    // Pixels with little colour get a larger saturation boost than already-vivid ones.
+    // Pixels with little color get a larger saturation boost than already-vivid ones.
     if (u_enableVibrance) {
         highp vec3 coefLuma = vec3(0.212656, 0.715158, 0.072186);
         float luma = dot(coefLuma, color);

@@ -1,1 +1,7 @@
--keep class com.davemorrissey.labs.subscaleview.** { *; }
+# JNI resolves native methods by class + method name.
+-keepclasseswithmembers class com.davemorrissey.labs.subscaleview.** { native <methods>; }
+# CompatDecoderFactory creates decoders reflectively through their constructors.
+-keepclassmembers class * implements com.davemorrissey.labs.subscaleview.decoder.ImageDecoder { <init>(...); }
+-keepclassmembers class * implements com.davemorrissey.labs.subscaleview.decoder.ImageRegionDecoder { <init>(...); }
+# ImageViewState / ImageSource are Parcelable (state restore).
+-keepclassmembers class com.davemorrissey.labs.subscaleview.** implements android.os.Parcelable { public static final ** CREATOR; }

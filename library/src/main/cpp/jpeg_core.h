@@ -7,14 +7,14 @@
 #include <cstdint>
 
 struct JpegSource {
-    uint8_t *map_base;   // mmap base (page aligned) or nullptr for caller-owned memory
+    uint8_t *map_base;  // mmap base (page aligned) or nullptr for caller-owned memory
     size_t map_len;
-    const uint8_t *data; // start of the JPEG stream
+    const uint8_t *data;  // start of the JPEG stream
     size_t size;
     int width;
     int height;
-    int subsamp;         // TJSAMP_*
-    int progressive;     // 1 for progressive / multi-scan
+    int subsamp;      // TJSAMP_*
+    int progressive;  // 1 for progressive / multi-scan
 };
 
 /** Everything needed to decode one tile; computed once, shared by the direct and the staged path. */

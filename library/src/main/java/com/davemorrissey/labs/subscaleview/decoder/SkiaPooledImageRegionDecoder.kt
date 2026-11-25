@@ -56,6 +56,7 @@ public open class SkiaPooledImageRegionDecoder @JvmOverloads constructor(
 		},
 	)
 
+	@Volatile
 	private var decoderPool: DecoderPool? = DecoderPool()
 	private val decoderLock: ReadWriteLock = ReentrantReadWriteLock(true)
 	private var context: Context? = null
@@ -85,25 +86,23 @@ public open class SkiaPooledImageRegionDecoder @JvmOverloads constructor(
 	private fun lazyInit() {
 		if (isLazyInited.compareAndSet(false, true) && fileLength < Long.MAX_VALUE) {
 			debug("Starting lazy init of additional decoders")
-			thread(start = true) {
-				while (decoderPool != null && allowAdditionalDecoder(
-						decoderPool!!.size,
-						fileLength,
-					)
-				) {
+			thread(start = true, isDaemon = true, name = "ssiv-lazy-decoder", priority = Thread.MIN_PRIORITY) {
+				while (true) {
+					// Local copy: the pool can be recycled (set to null) at any moment.
+					val pool = decoderPool ?: break
+					if (!allowAdditionalDecoder(pool.size, fileLength)) break
 					// New decoders can be created while reading tiles but this read lock prevents
 					// them being initialised while the pool is being recycled.
 					try {
-						if (decoderPool != null) {
-							val start = System.currentTimeMillis()
-							debug("Starting decoder")
-							initialiseDecoder()
-							val end = System.currentTimeMillis()
-							debug("Started decoder, took " + (end - start) + "ms")
-						}
+						val start = System.currentTimeMillis()
+						debug("Starting decoder")
+						initialiseDecoder()
+						val end = System.currentTimeMillis()
+						debug("Started decoder, took " + (end - start) + "ms")
 					} catch (e: Exception) {
-						// A decoder has already been successfully created so we can ignore this
+						// A decoder already exists, so the pool still works; stop instead of retrying in a tight loop.
 						debug("Failed to start decoder: " + e.message)
+						break
 					}
 				}
 			}
@@ -204,7 +203,8 @@ public open class SkiaPooledImageRegionDecoder @JvmOverloads constructor(
 		imageDimensions[decoder.width] = decoder.height
 		decoderLock.writeLock().lock()
 		try {
-			decoderPool?.add(decoder)
+			val pool = decoderPool
+			if (pool != null) pool.add(decoder) else decoder.recycle() // pool recycled meanwhile: free the native decoder
 		} finally {
 			decoderLock.writeLock().unlock()
 		}
@@ -253,7 +253,7 @@ public open class SkiaPooledImageRegionDecoder @JvmOverloads constructor(
 	 * Holding a read lock to avoid returning true while the pool is being recycled, this returns
 	 * true if the pool has at least one decoder available.
 	 */
-	@get:Synchronized
+	// Lock-free for the same reason as SkiaImageRegionDecoder.isReady (the pool has its own lock).
 	override val isReady: Boolean
 		get() = decoderPool?.isEmpty == false
 

@@ -12,6 +12,7 @@ import android.net.Uri
 import android.os.Build
 import android.os.ParcelFileDescriptor
 import android.text.TextUtils
+import android.util.Log
 import androidx.annotation.WorkerThread
 import com.davemorrissey.labs.subscaleview.internal.URI_PATH_ASSET
 import com.davemorrissey.labs.subscaleview.internal.URI_SCHEME_CONTENT
@@ -21,7 +22,9 @@ import com.davemorrissey.labs.subscaleview.internal.URI_SCHEME_ZIP
 import java.io.File
 import java.io.IOException
 import java.io.InputStream
+import java.io.RandomAccessFile
 import java.util.UUID
+import java.util.concurrent.atomic.AtomicInteger
 import java.util.concurrent.locks.ReentrantReadWriteLock
 import java.util.zip.ZipFile
 import kotlin.concurrent.read
@@ -60,6 +63,9 @@ public class LiJpegTurboRegionDecoder(
 	@Volatile
 	private var recycled = false
 
+	// Consecutive native decode failures; after NATIVE_FAILURE_LIMIT the native path is skipped for this image.
+	private val nativeFailures = AtomicInteger()
+
 	private var appContext: Context? = null
 	private var sourceUri: Uri? = null
 
@@ -73,11 +79,13 @@ public class LiJpegTurboRegionDecoder(
 		var temp: File? = null
 		var opened = 0L
 		var size: IntArray? = null
+		var progressive = false
 		try {
-			val source = resolveNativeSource(ctx, uri)
+			val source = if (nativeBroken) null else resolveNativeSource(ctx, uri)
 			if (source != null) {
 				temp = source.privateTemp
 				opened = openNative(source)
+				progressive = opened != 0L && isProgressiveJpeg(source.file, source.offset)
 				size = if (opened != 0L) JpegNative.nativeInfo(opened) else null
 				if (size == null && opened != 0L) {
 					JpegNative.nativeClose(opened)
@@ -87,6 +95,12 @@ public class LiJpegTurboRegionDecoder(
 		} catch (_: Exception) {
 			// Anything unexpected on the fast path: use the Skia path below.
 			if (opened != 0L) JpegNative.nativeClose(opened)
+			opened = 0L
+			size = null
+		} catch (e: LinkageError) {
+			// Native library missing or unloadable (UnsatisfiedLinkError): never try it again, use Skia.
+			Log.w("LiJpegTurbo", "Native JPEG path unavailable", e)
+			nativeBroken = true
 			opened = 0L
 			size = null
 		}
@@ -102,6 +116,8 @@ public class LiJpegTurboRegionDecoder(
 				sourceUri = uri
 				privateTemp = temp
 				handle = opened
+				// A progressive JPEG has no independent rows: every region re-decodes the whole image.
+				costlyRegions = progressive
 			}
 			return Point(size[0], size[1])
 		}
@@ -129,7 +145,7 @@ public class LiJpegTurboRegionDecoder(
 			check(!recycled) { "Cannot decode region - decoder recycled" }
 			val h = handle
 			if (h != 0L) {
-				if (sample <= MAX_NATIVE_SAMPLE) {
+				if (sample <= MAX_NATIVE_SAMPLE && nativeFailures.get() < NATIVE_FAILURE_LIMIT) {
 					val start = System.nanoTime()
 					val bmp = JpegNative.nativeDecodeRegion(
 						h,
@@ -141,9 +157,11 @@ public class LiJpegTurboRegionDecoder(
 						quality.toBitmapConfig() == Bitmap.Config.RGB_565,
 					)
 					if (bmp != null) {
+						nativeFailures.set(0)
 						DecoderStats.onNativeTile(System.nanoTime() - start)
 						return bmp
 					}
+					nativeFailures.incrementAndGet()
 				}
 				DecoderStats.onSkiaFallback()
 			}
@@ -247,6 +265,37 @@ public class LiJpegTurboRegionDecoder(
 				if (!ok) temp.delete()
 			}
 		}
+	}
+
+	/** True when the JPEG at [offset] in [file] declares a progressive frame (SOF2/6/10/14). Header walk only. */
+	private fun isProgressiveJpeg(file: File, offset: Long): Boolean = try {
+		RandomAccessFile(file, "r").use { raf ->
+			var pos = offset + 2 // after SOI
+			var result = false
+			var steps = 0
+			val two = ByteArray(2)
+			while (steps++ < MAX_MARKER_STEPS) {
+				raf.seek(pos)
+				val b = raf.read()
+				if (b != 0xFF) break
+				var m = raf.read()
+				while (m == 0xFF) m = raf.read() // fill bytes
+				if (m < 0 || m == 0xD9 || m == 0xDA) break
+				if (m in 0xC0..0xCF && m != 0xC4 && m != 0xC8 && m != 0xCC) {
+					result = m == 0xC2 || m == 0xC6 || m == 0xCA || m == 0xCE
+					break
+				}
+				if (m in 0xD0..0xD8 || m == 0x01) {
+					pos = raf.filePointer // standalone marker, no length
+					continue
+				}
+				if (raf.read(two) != 2) break
+				pos = raf.filePointer + (((two[0].toInt() and 0xFF) shl 8) or (two[1].toInt() and 0xFF)) - 2
+			}
+			result
+		}
+	} catch (_: IOException) {
+		false
 	}
 
 	private fun openNative(source: NativeSource): Long = ParcelFileDescriptor.open(source.file, ParcelFileDescriptor.MODE_READ_ONLY).use { pfd ->
@@ -360,6 +409,10 @@ public class LiJpegTurboRegionDecoder(
 	private companion object {
 		/** libjpeg-turbo scales by 1/1, 1/2, 1/4 and 1/8 only; larger samples are decoded by Skia. */
 		const val MAX_NATIVE_SAMPLE = 8
+		private const val NATIVE_FAILURE_LIMIT = 3
+		@Volatile
+		var nativeBroken = false
+		const val MAX_MARKER_STEPS = 64
 		const val COPY_BUFFER_BYTES = 64 * 1024
 		const val MAX_CACHED_ENTRY_BYTES = 64L * 1024 * 1024
 		const val MAX_CACHE_FILES = 24
@@ -405,6 +458,8 @@ public class LiJpegTurboRegionDecoder(
 			var count = files.size
 			var bytes = files.sumOf { it.length() }
 			for (f in files) {
+				// A young .tmp belongs to an extraction still in flight on another thread.
+				if (f.name.endsWith(".tmp") && now - f.lastModified() < 5 * 60 * 1000L) continue
 				val stale = now - f.lastModified() > STALE_AFTER_MS
 				if (!stale && count < MAX_CACHE_FILES && bytes < MAX_CACHE_BYTES) break
 				val len = f.length()

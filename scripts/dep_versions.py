@@ -101,6 +101,11 @@ def metadata_versions(group: str, name: str) -> tuple[str | None, list[str]]:
     order = ORDER_DEFAULT
     if group.startswith("com.github."):
         order = ["jitpack"] + [r for r in ORDER_DEFAULT if r != "jitpack"]
+    elif group.startswith("com.google.devtools.ksp"):
+        order = ["central", "portal", "google", "jitpack"]  # Google Maven holds an ancient KSP 1.5.30
+    elif name.endswith(".gradle.plugin"):
+        # plugin markers: Google Maven only carries stale copies (e.g. KSP 1.5.30), the portal has the real ones
+        order = ["portal", "central", "google", "jitpack"]
     for repo in order:
         if repo not in REPOS:
             continue

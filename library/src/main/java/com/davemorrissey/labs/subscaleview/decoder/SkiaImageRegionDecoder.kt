@@ -33,7 +33,11 @@ public class SkiaImageRegionDecoder @JvmOverloads constructor(
         },
     )
 
+    @Volatile
     private var decoder: BitmapRegionDecoder? = null
+
+    @Volatile
+    private var recycled = false
     private val decoderLock: ReadWriteLock = ReentrantReadWriteLock(true)
 
     private val decodeLock: Lock
@@ -83,7 +87,17 @@ public class SkiaImageRegionDecoder @JvmOverloads constructor(
             }
             else -> throw UnsupportedUriException(uri.toString())
         }
-        decoder = brd
+        // recycle() may have run while the (slow) open above was in progress: do not leak the new decoder.
+        decoderLock.writeLock().lock()
+        try {
+            if (recycled) {
+                brd.recycle()
+                error("Decoder recycled")
+            }
+            decoder = brd
+        } finally {
+            decoderLock.writeLock().unlock()
+        }
         return Point(brd.width, brd.height)
     }
 
@@ -105,13 +119,16 @@ public class SkiaImageRegionDecoder @JvmOverloads constructor(
         }
     }
 
+    // Lock-free: a @Synchronized getter would block the caller (often the main thread) behind recycle(), which
+    // itself waits for running tile decodes.
     override val isReady: Boolean
-        @Synchronized get() = decoder?.isRecycled == false
+        get() = decoder?.isRecycled == false
 
     @Synchronized
     override fun recycle() {
         decoderLock.writeLock().lock()
         try {
+            recycled = true
             decoder?.recycle()
             decoder = null
         } finally {
